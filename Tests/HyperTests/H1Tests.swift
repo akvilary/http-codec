@@ -106,12 +106,15 @@ struct H1EncodeTests {
             headers: HeaderMap(),
             body: Body([0x68, 0x69])  // "hi"
         )
-        encoder.encodeHead(response, keepAlive: true, into: &buffer)
+        let head = encoder.encodeHead(response, keepAlive: true, into: &buffer)
         let s = String(decoding: buffer, as: UTF8.self)
+        #expect(head == .buffered)
         #expect(s.hasPrefix("HTTP/1.1 200 OK\r\n"))
         #expect(s.contains("Content-Length: 2"))
         #expect(s.contains("Connection: keep-alive"))
-        #expect(s.hasSuffix("\r\n\r\nhi"))
+        // Body is NOT in the buffer — caller uses writev to write
+        // header + body separately.
+        #expect(!s.contains("hi"))
     }
 
     @Test("Encode Connection: close when keepAlive=false")

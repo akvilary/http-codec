@@ -90,6 +90,15 @@ public struct H1Decoder: Sendable {
     /// the connection driver.
     public let buffer: ReadBuffer
 
+    /// Reusable HeaderMap — cleared and repopulated per request.
+    /// Avoids [(HeaderName, HeaderValue)] array allocation per
+    /// keep-alive request. Same pattern as hyper's `cached_headers`.
+    @usableFromInline internal var reusableHeaders = HeaderMap()
+
+    /// Reusable Extensions — cleared and repopulated per request.
+    /// Avoids Dictionary allocation per request.
+    @usableFromInline internal var reusableExtensions = Extensions()
+
     /// Per-instance limits. Mirrors hyper's `h1_max_headers` /
     /// `max_buf_size` settings on a `Conn`.
     public let maxRequestBytes: Int
@@ -138,7 +147,7 @@ public struct H1Decoder: Sendable {
     ///
     /// On `.needsMore`: leaves the buffer intact; caller must `feed`
     /// more bytes from the socket.
-    public func decode() throws -> DecodeResult {
+    public mutating func decode() throws -> DecodeResult {
         // Step 1: scan for the end of the headers block (\r\n\r\n).
         guard let headerEnd = findHeaderBlockEnd() else {
             return .needsMore
@@ -189,7 +198,7 @@ public struct H1Decoder: Sendable {
     /// Parse method + target + version + headers from the header block.
     /// Does NOT touch the body.
     @inlinable
-    internal func parseRequestHeaders(upTo headerEnd: Int) throws -> Request<Body>? {
+    internal mutating func parseRequestHeaders(upTo headerEnd: Int) throws -> Request<Body>? {
         var pos = 0
         // ── Request line ────────────────────────────────────────────
         // METHOD SP TARGET SP HTTP/x.y CRLF
@@ -237,7 +246,10 @@ public struct H1Decoder: Sendable {
         pos &+= 2
 
         // ── Headers ────────────────────────────────────────────────
-        var headers = HeaderMap()
+        // Reuse the per-decoder HeaderMap — clear entries but
+        // preserve backing array capacity. Avoids array allocation
+        // per keep-alive request (matches hyper's cached_headers).
+        reusableHeaders.entries.removeAll(keepingCapacity: true)
         var headerIndex = 0
         var contentLength: Int? = nil
         var contentLengthCount = 0
@@ -288,7 +300,7 @@ public struct H1Decoder: Sendable {
             }
             let valueBytes = Array(buffer[valueStart..<valueEnd])
             let value = HeaderValue(bytes: valueBytes)
-            headers.append(name, value)
+            reusableHeaders.append(name, value)
 
             // Track content-length / transfer-encoding for body parsing.
             // Compare against lowercased ASCII bytes — constant-time-ish.
@@ -337,15 +349,15 @@ public struct H1Decoder: Sendable {
                 let (chunkedBytes, consumedPos) = try parseChunkedBody(
                     headerEnd: headerEnd, headerIndex: headerIndex
                 )
+                reusableExtensions.removeAll()
                 var request = Request<Body>(
                     method: method,
                     uri: uri,
                     version: version,
-                    headers: headers,
-                    body: .buffered(chunkedBytes)
+                    headers: reusableHeaders,
+                    body: .buffered(chunkedBytes),
+                    extensions: reusableExtensions
                 )
-                // Stash consumed position so decode() knows how many
-                // bytes to consume from the buffer.
                 request.extensions.insert(ChunkedBytesConsumed(consumedPos))
                 return request
             } catch H1DecodeError.incompleteChunkedBody {
@@ -356,15 +368,16 @@ public struct H1Decoder: Sendable {
             }
         }
 
-        // Stash the parsed content-length in the request's extensions
-        // so resolveBodyEnd() can find it. (A cleaner cut: thread it
-        // through the call chain — phase-2 polish.)
+        // Reuse Extensions — clear storage but preserve capacity.
+        reusableExtensions.removeAll()
+
         var request = Request<Body>(
             method: method,
             uri: uri,
             version: version,
-            headers: headers,
-            body: .empty
+            headers: reusableHeaders,
+            body: .empty,
+            extensions: reusableExtensions
         )
         if let cl = contentLength {
             request.extensions.insert(ParsedContentLength(length: cl))

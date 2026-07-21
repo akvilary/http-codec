@@ -79,10 +79,18 @@ public final class ReadBuffer: @unchecked Sendable {
         writePos += n
     }
 
-    /// Ensure at least `needed` bytes of writable space. Compacts
-    /// first; grows if still insufficient.
+    /// Ensure at least `needed` bytes of writable space. Fast path
+    /// (enough space) is @inlinable for cross-module inlining; the
+    /// slow path (compact/grow) is a function call.
+    @inlinable
     public func ensureCapacity(_ needed: Int) {
         if writableBytes >= needed { return }
+        ensureCapacitySlow(needed)
+    }
+
+    /// Slow path — compact then grow if still insufficient.
+    @usableFromInline
+    internal func ensureCapacitySlow(_ needed: Int) {
         compact()
         if writableBytes >= needed { return }
         let newCap = Swift.max(capacity * 2, writePos + needed)
