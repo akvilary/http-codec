@@ -30,7 +30,7 @@ struct H1DecodeTests {
     }
 
     @Test("Parse a POST with body via Content-Length")
-    func postWithBody() throws {
+    func postWithBody() async throws {
         var decoder = H1Decoder()
         let raw = "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
         try decoder.feed([UInt8](raw.utf8))
@@ -40,17 +40,31 @@ struct H1DecodeTests {
             return
         }
         #expect(request.method == .POST)
-        #expect(request.body.count == 5)
-        #expect(String(decoding: request.body.bytes, as: UTF8.self) == "hello")
+        if case .buffered(let b) = request.body {
+            #expect(b.count == 5)
+            #expect(String(decoding: b, as: UTF8.self) == "hello")
+        } else {
+            Issue.record("expected .buffered body")
+        }
     }
 
-    @Test("Reject chunked Transfer-Encoding (Phase-1 limitation)")
-    func rejectsChunked() throws {
+    @Test("Parse a chunked Transfer-Encoding request body")
+    func chunkedRequest() throws {
         var decoder = H1Decoder()
-        let raw = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+        // Two chunks: "hello" (5) + "world" (5), then terminating 0-chunk.
+        let raw = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" +
+                  "5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n"
         try decoder.feed([UInt8](raw.utf8))
-        #expect(throws: H1DecodeError.self) {
-            _ = try decoder.decode()
+        let result = try decoder.decode()
+        guard case .complete(let request) = result else {
+            Issue.record("expected .complete")
+            return
+        }
+        #expect(request.method == .POST)
+        if case .buffered(let b) = request.body {
+            #expect(String(decoding: b, as: UTF8.self) == "helloworld")
+        } else {
+            Issue.record("expected .buffered body from chunked")
         }
     }
 
@@ -92,7 +106,7 @@ struct H1EncodeTests {
             headers: HeaderMap(),
             body: Body([0x68, 0x69])  // "hi"
         )
-        encoder.encode(response, keepAlive: true, into: &buffer)
+        encoder.encodeHead(response, keepAlive: true, into: &buffer)
         let s = String(decoding: buffer, as: UTF8.self)
         #expect(s.hasPrefix("HTTP/1.1 200 OK\r\n"))
         #expect(s.contains("Content-Length: 2"))
@@ -105,7 +119,7 @@ struct H1EncodeTests {
         let encoder = H1Encoder()
         var buffer: [UInt8] = []
         let response = Response<Body>(status: .notFound, body: Body("nope"))
-        encoder.encode(response, keepAlive: false, into: &buffer)
+        encoder.encodeHead(response, keepAlive: false, into: &buffer)
         let s = String(decoding: buffer, as: UTF8.self)
         #expect(s.hasPrefix("HTTP/1.1 404 Not Found\r\n"))
         #expect(s.contains("Connection: close"))

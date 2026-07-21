@@ -61,6 +61,13 @@ public enum H1DecodeError: Error, Sendable, Equatable {
     case tooManyHeaders
     /// An empty header name was encountered. RFC 9112 §5.1.
     case emptyHeaderName
+    /// A `Transfer-Encoding: chunked` request body was malformed.
+    /// Mirrors `hyper::Error::new_body_write_aborted` for decode failures.
+    case malformedChunkSize
+    case malformedChunkData
+    /// A chunked body needs more bytes — the buffer doesn't yet contain
+    /// the terminating 0-chunk. Caller should `feed` more and retry.
+    case incompleteChunkedBody
 }
 
 /// HTTP/1.1 incremental request decoder.
@@ -129,7 +136,11 @@ public struct H1Decoder: Sendable {
             return .needsMore
         }
         // Step 2: parse request line + headers from buffer[0..<headerEnd].
-        let request = try parseRequestHeaders(upTo: headerEnd)
+        // Returns nil if the (chunked) body isn't fully in the buffer
+        // yet — caller should feed more bytes.
+        guard let request = try parseRequestHeaders(upTo: headerEnd) else {
+            return .needsMore
+        }
         // Step 3: determine body length, read body bytes if any.
         let bodyEnd = try resolveBodyEnd(headersEnd: headerEnd, request: request)
         guard buffer.count >= bodyEnd else {
@@ -143,7 +154,7 @@ public struct H1Decoder: Sendable {
         var finalRequest = request
         if bodyEnd > headerEnd {
             let bodyBytes = Array(buffer[headerEnd..<bodyEnd])
-            finalRequest.body = Body(bodyBytes)
+            finalRequest.body = .buffered(bodyBytes)
         }
         // Step 5: consume parsed bytes, preserving pipelined tail.
         buffer.removeFirst(bodyEnd)
@@ -179,7 +190,7 @@ public struct H1Decoder: Sendable {
     /// Parse method + target + version + headers from the header block.
     /// Does NOT touch the body.
     @inlinable
-    internal func parseRequestHeaders(upTo headerEnd: Int) throws -> Request<Body> {
+    internal mutating func parseRequestHeaders(upTo headerEnd: Int) throws -> Request<Body>? {
         var pos = 0
         // ── Request line ────────────────────────────────────────────
         // METHOD SP TARGET SP HTTP/x.y CRLF
@@ -309,9 +320,38 @@ public struct H1Decoder: Sendable {
         }
 
         if transferEncodingSeen {
-            // Phase-1: reject chunked. Phase-2 will port hyper's
-            // chunked decoder (hyper::proto::h1::decode::Decoder::chunked).
-            throw H1DecodeError.chunkedNotSupported
+            // Parse the body as chunked Transfer-Encoding
+            // (RFC 9112 §7.1). Each chunk is:
+            //
+            //   <hex-size>[;extensions]\r\n
+            //   <size bytes>\r\n
+            //
+            // Terminated by a zero-size chunk:
+            //
+            //   0\r\n\r\n
+            //
+            // For v0.1 we buffer all chunks into a single Body.buffered
+            // (matches axum's default behavior when an extractor calls
+            // `to_bytes(body, limit)`). True streaming request body
+            // (Body.stream from a chunked source) is phase-2 polish.
+            do {
+                let chunkedBytes = try parseChunkedBody(
+                    headerEnd: headerEnd, headerIndex: headerIndex
+                )
+                var request = Request<Body>(
+                    method: method,
+                    uri: uri,
+                    version: version,
+                    headers: headers,
+                    body: .buffered(chunkedBytes)
+                )
+                return request
+            } catch H1DecodeError.incompleteChunkedBody {
+                // Body not yet fully in the buffer — caller should
+                // feed more bytes and retry. Propagate as nil so the
+                // outer decode() returns .needsMore.
+                return nil
+            }
         }
 
         // Stash the parsed content-length in the request's extensions
@@ -322,7 +362,7 @@ public struct H1Decoder: Sendable {
             uri: uri,
             version: version,
             headers: headers,
-            body: Body()
+            body: .empty
         )
         if let cl = contentLength {
             request.extensions.insert(ParsedContentLength(length: cl))
@@ -344,6 +384,109 @@ public struct H1Decoder: Sendable {
             return headersEnd
         }
         return headersEnd + cl
+    }
+
+    /// Parse a chunked Transfer-Encoding body. Direct port of
+    /// `hyper::proto::h1::decode::Decoder::chunked` (simplified —
+    /// we buffer all chunks into memory rather than streaming).
+    ///
+    /// Grammar (RFC 9112 §7.1):
+    ///
+    ///     chunk          = chunk-size [ chunk-ext ] CRLF chunk-data CRLF
+    ///     chunk-size     = 1*HEXDIG
+    ///     chunk-ext      = *( ";" chunk-ext-name [ "=" chunk-ext-val ] )
+    ///     chunk-data     = 1*OCTET  ; a sequence of chunk-size octets
+    ///     last-chunk     = 1*("0") [ chunk-ext ] CRLF
+    ///     trailer-part   = *( header-field CRLF )
+    ///     CRLF           = CR LF
+    ///
+    /// Returns the buffered body bytes. Throws on malformed input or
+    /// if the buffer doesn't yet contain the full chunked body — the
+    /// caller should `feed` more bytes and retry in the latter case.
+    @usableFromInline
+    internal mutating func parseChunkedBody(headerEnd: Int, headerIndex: Int) throws -> [UInt8] {
+        var pos = headerEnd
+        var body: [UInt8] = []
+
+        chunkLoop: while pos < buffer.count {
+            // ── Read hex chunk size ──────────────────────────────
+            let sizeStart = pos
+            while pos < buffer.count && buffer[pos] != 0x0D && buffer[pos] != 0x3B {
+                pos &+= 1  // scan until CR or ';' (chunk-ext)
+            }
+            guard pos < buffer.count else {
+                throw H1DecodeError.incompleteChunkedBody
+            }
+            // Parse hex size.
+            let sizeBytes = buffer[sizeStart..<pos]
+            guard !sizeBytes.isEmpty,
+                  let chunkSize = Self.parseHex(sizeBytes)
+            else {
+                throw H1DecodeError.malformedChunkSize
+            }
+            // Skip chunk-ext (anything until CRLF).
+            while pos + 1 < buffer.count,
+                  !(buffer[pos] == 0x0D && buffer[pos + 1] == 0x0A) {
+                pos &+= 1
+            }
+            // Consume CRLF after size.
+            guard pos + 1 < buffer.count,
+                  buffer[pos] == 0x0D, buffer[pos + 1] == 0x0A
+            else { throw H1DecodeError.malformedChunkSize }
+            pos &+= 2
+
+            // ── Last-chunk (size 0) → end of body ────────────────
+            if chunkSize == 0 {
+                // Skip optional trailer-part + final CRLF.
+                while pos + 1 < buffer.count,
+                      !(buffer[pos] == 0x0D && buffer[pos + 1] == 0x0A) {
+                    pos &+= 1
+                }
+                // Consume final CRLF.
+                if pos + 1 < buffer.count,
+                   buffer[pos] == 0x0D, buffer[pos + 1] == 0x0A {
+                    pos &+= 2
+                }
+                // Update `parsed` so the codec consumes the entire
+                // chunked body when it discardUsedBytes().
+                parsed = pos
+                return body
+            }
+
+            // ── Read chunk-data + trailing CRLF ──────────────────
+            guard pos + chunkSize + 1 < buffer.count else {
+                throw H1DecodeError.incompleteChunkedBody
+            }
+            body.append(contentsOf: buffer[pos..<(pos + chunkSize)])
+            pos &+= chunkSize
+            // Consume CRLF after data.
+            guard buffer[pos] == 0x0D, buffer[pos + 1] == 0x0A
+            else { throw H1DecodeError.malformedChunkData }
+            pos &+= 2
+        }
+
+        // We exhausted the buffer without seeing the terminating 0-chunk.
+        throw H1DecodeError.incompleteChunkedBody
+    }
+
+    /// Parse an ASCII hex string into an Int. Returns `nil` on invalid
+    /// digits or overflow.
+    @inlinable
+    internal static func parseHex<S: Sequence>(_ bytes: S) -> Int?
+    where S.Element == UInt8 {
+        var result = 0
+        for b in bytes {
+            let digit: Int
+            switch b {
+            case 0x30...0x39: digit = Int(b - 0x30)        // 0-9
+            case 0x41...0x46: digit = Int(b - 0x41 + 10)   // A-F
+            case 0x61...0x66: digit = Int(b - 0x61 + 10)   // a-f
+            default: return nil
+            }
+            result = result * 16 + digit
+            if result < 0 || result > 1024 * 1024 * 1024 { return nil }  // 1 GiB cap
+        }
+        return result
     }
 
     // MARK: - SWAR-style byte helpers (kept simple for v0.1)

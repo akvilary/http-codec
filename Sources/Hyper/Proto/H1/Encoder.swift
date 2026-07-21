@@ -4,7 +4,19 @@
 //  Hyper/Proto/H1
 //
 //  Port of `hyper::proto::h1::Encoder`. Serialises an HTTP/1.1
-//  response into a byte buffer ready for `writev` over the socket.
+//  response in two phases:
+//
+//    1. `encodeHead(...)` — writes status line + headers into the
+//       output buffer. Decides whether to use Content-Length (body
+//       size known) or chunked Transfer-Encoding (streaming body).
+//       Returns an `EncodedHead` describing what to do next.
+//
+//    2. The caller acts on `EncodedHead`:
+//         - `.buffered(bytes)`: the body is already in the buffer.
+//           Just flush.
+//         - `.stream`: pull chunks from `body.dataStream()` and
+//           call `encodeChunk(...)` for each, then `encodeEndOfChunks`
+//           at the end.
 //
 //  Mirrors hyper's zero-interpolation design: static parts of the
 //  status line and well-known header names are written via direct
@@ -16,23 +28,25 @@
 import Foundation
 import HTTP
 
+/// Result of `H1Encoder.encodeHead(...)`. Tells the caller what to
+/// do with the body next.
+public enum EncodedHead: Sendable {
+    /// The body was buffered — it's already in the output buffer.
+    /// Caller can flush immediately.
+    case buffered
+    /// The body is streaming — caller must iterate `body.dataStream()`
+    /// and call `encodeChunk(...)` for each chunk, then
+    /// `encodeEndOfChunks(...)` when done.
+    case stream
+    /// The response has no body (HEAD response, 204/304, etc.).
+    case noBody
+}
+
 /// HTTP/1.1 response encoder. Port of `hyper::proto::h1::Encoder`.
-///
-/// Writes a `Response<Body>` into a `inout [UInt8]` accumulator. The
-/// caller owns the accumulator (typically the connection's reusable
-/// write buffer); the encoder just appends.
 public struct H1Encoder: Sendable {
 
-    /// Configuration — mirrors hyper's configurable flags but kept
-    /// minimal for v0.1.
     public struct Config: Sendable {
-        /// Emit a `Date:` header automatically. Defaults to `true`.
         public var emitDateHeader: Bool = true
-        /// Title-case header names (`Content-Type` vs `content-type`).
-        /// Defaults to `true` — matches what hyper does for HTTP/1.1
-        /// and what RFC 9110 §5.1 historically shows in examples.
-        /// (HTTP/2 mandates lowercase per RFC 9113 §8.1.1 — that's
-        /// the H2 encoder's concern, not the H1's.)
         public var titleCaseHeaders: Bool = true
         @inlinable public init() {}
     }
@@ -43,77 +57,132 @@ public struct H1Encoder: Sendable {
         self.config = config
     }
 
-    /// Encode `response` into `buffer`. Sets keep-alive based on
-    /// version + Connection header.
+    // MARK: - Phase 1: encode status + headers
+
+    /// Encode the response status line + headers into `buffer`. Does
+    /// NOT touch the body.
     ///
-    /// Returns the number of bytes appended.
+    /// For a `.buffered` body: also writes the body bytes (since they
+    /// are immediately available) and returns `.buffered`.
+    ///
+    /// For a `.stream` body: writes the headers + an auto-chunked
+    /// `Transfer-Encoding` header (unless the user already set one),
+    /// returns `.stream`. Caller must follow up with `encodeChunk`
+    /// and `encodeEndOfChunks`.
+    ///
+    /// For `.empty` body (or HEAD response): writes headers, returns
+    /// `.noBody`.
     @discardableResult
-    public func encode(
+    public func encodeHead(
         _ response: Response<Body>,
         keepAlive: Bool,
         into buffer: inout [UInt8]
-    ) -> Int {
+    ) -> EncodedHead {
         let start = buffer.count
 
         // ── Status line ───────────────────────────────────────────
         writeStatusLine(response.status, into: &buffer)
-        buffer.append(contentsOf: Self.crlf)  // CRLF
+        buffer.append(contentsOf: Self.crlf)
 
-        // ── Headers ───────────────────────────────────────────────
-        // Auto-add Content-Length / Connection if not present.
+        // ── Decide body framing strategy BEFORE writing user headers,
+        //    so we can check whether they pre-set TE / CL.
         var sawContentLength = false
+        var sawTransferEncoding = false
         var sawConnection = false
-        let bodyLen = response.body.count
+        for (name, _) in response.headers.entries {
+            if name == .contentLength   { sawContentLength = true }
+            if name == .transferEncoding { sawTransferEncoding = true }
+            if name == .connection       { sawConnection = true }
+        }
+
+        let isStreaming: Bool
+        switch response.body {
+        case .empty:        isStreaming = false
+        case .buffered:     isStreaming = false
+        case .stream:       isStreaming = true
+        }
+
+        // ── Write user headers ────────────────────────────────────
         for (name, value) in response.headers.entries {
             writeHeaderName(name, into: &buffer)
-            buffer.append(0x3A)  // ':'
-            buffer.append(0x20)  // ' '
+            buffer.append(0x3A)
+            buffer.append(0x20)
             buffer.append(contentsOf: value.bytes)
             buffer.append(contentsOf: Self.crlf)
-
-            if name == .contentLength { sawContentLength = true }
-            if name == .connection    { sawConnection = true }
         }
 
-        if !sawContentLength && bodyLen > 0 {
-            writeStaticHeader(.contentLength, value: String(bodyLen), into: &buffer)
-        }
-        if !sawConnection {
-            if keepAlive {
-                writeStaticHeader(.connection, value: "keep-alive", into: &buffer)
-            } else {
-                writeStaticHeader(.connection, value: "close", into: &buffer)
+        // ── Auto-add framing headers if the user didn't ───────────
+        if isStreaming {
+            // Chunked TE — required since we don't know the size upfront.
+            if !sawTransferEncoding {
+                writeStaticHeader(.transferEncoding, value: "chunked", into: &buffer)
             }
+        } else if case .buffered(let bytes) = response.body, !bytes.isEmpty, !sawContentLength {
+            writeStaticHeader(.contentLength, value: String(bytes.count), into: &buffer)
+        } else if case .empty = response.body, !sawContentLength {
+            // Empty body — emit Content-Length: 0 unless user overrode.
+            writeStaticHeader(.contentLength, value: "0", into: &buffer)
+        }
+
+        if !sawConnection {
+            let value = keepAlive ? "keep-alive" : "close"
+            writeStaticHeader(.connection, value: value, into: &buffer)
         }
 
         // ── Empty line separating headers from body ───────────────
         buffer.append(contentsOf: Self.crlf)
 
-        // ── Body ──────────────────────────────────────────────────
-        if !response.body.isEmpty {
-            buffer.append(contentsOf: response.body.bytes)
+        // ── Buffered body: write it now ───────────────────────────
+        if case .buffered(let bytes) = response.body, !bytes.isEmpty {
+            buffer.append(contentsOf: bytes)
+            return .buffered
         }
+        return isStreaming ? .stream : .noBody
+    }
 
-        return buffer.count - start
+    // MARK: - Phase 2: streaming body chunks
+
+    /// Write a single chunk to `buffer` in chunked TE format:
+    ///
+    ///     <hex-size>\r\n
+    ///     <bytes>\r\n
+    ///
+    /// Caller owns the buffer; this just appends.
+    public func encodeChunk(_ bytes: [UInt8], into buffer: inout [UInt8]) {
+        guard !bytes.isEmpty else { return }
+        // Hex size — bodies up to ~64 GiB supported via UInt64.
+        let hex = String(bytes.count, radix: 16)
+        buffer.append(contentsOf: Array(hex.utf8))
+        buffer.append(contentsOf: Self.crlf)
+        buffer.append(contentsOf: bytes)
+        buffer.append(contentsOf: Self.crlf)
+    }
+
+    /// Write the terminating zero-length chunk:
+    ///
+    ///     0\r\n
+    ///     \r\n
+    ///
+    /// Sent after the last data chunk. Optionally includes trailers
+    /// (Phase 2 polish — currently no trailers support).
+    public func encodeEndOfChunks(into buffer: inout [UInt8]) {
+        buffer.append(contentsOf: [0x30])  // '0'
+        buffer.append(contentsOf: Self.crlf)
+        buffer.append(contentsOf: Self.crlf)
     }
 
     // MARK: - Status line
 
     @inline(__always)
     private func writeStatusLine(_ status: StatusCode, into buffer: inout [UInt8]) {
-        // "HTTP/1.1 " — 9 ASCII bytes, written directly to avoid the
-        // SmallString bridging that `buffer.append(contentsOf: "..."utf8)`
-        // would incur.
         buffer.append(contentsOf: [
             0x48, 0x54, 0x54, 0x50, 0x2F, 0x31, 0x2E, 0x31, 0x20
         ])
-        // 3-digit status code — write each digit directly.
         let code = status.code
         buffer.append(0x30 + UInt8(code / 100))
         buffer.append(0x30 + UInt8((code / 10) % 10))
         buffer.append(0x30 + UInt8(code % 10))
-        buffer.append(0x20)  // SP
-        // Reason phrase.
+        buffer.append(0x20)
         buffer.append(contentsOf: Array(status.canonicalReason.utf8))
     }
 
@@ -122,15 +191,14 @@ public struct H1Encoder: Sendable {
     @inline(__always)
     private func writeHeaderName(_ name: HeaderName, into buffer: inout [UInt8]) {
         if config.titleCaseHeaders {
-            // Capitalize first letter of each dash-separated word.
             var cap = true
             for b in name.bytes {
-                if cap && b >= 0x61 && b <= 0x7A {  // a-z
+                if cap && b >= 0x61 && b <= 0x7A {
                     buffer.append(b - 0x20)
                 } else {
                     buffer.append(b)
                 }
-                cap = (b == 0x2D)  // '-'
+                cap = (b == 0x2D)
             }
         } else {
             buffer.append(contentsOf: name.bytes)
@@ -140,15 +208,13 @@ public struct H1Encoder: Sendable {
     @inline(__always)
     private func writeStaticHeader(_ name: HeaderName, value: String, into buffer: inout [UInt8]) {
         writeHeaderName(name, into: &buffer)
-        buffer.append(0x3A)  // ':'
-        buffer.append(0x20)  // ' '
+        buffer.append(0x3A)
+        buffer.append(0x20)
         buffer.append(contentsOf: value.utf8)
         buffer.append(contentsOf: Self.crlf)
     }
 }
 
-// CRLF as a static [UInt8] — written hundreds of times per response,
-// avoid re-allocating it.
 extension H1Encoder {
     @inlinable internal static var crlf: [UInt8] { [0x0D, 0x0A] }
 }

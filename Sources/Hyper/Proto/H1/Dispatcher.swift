@@ -84,7 +84,18 @@ public struct H1Dispatcher<Io: AsyncReadWrite>: Sendable {
     private func encodeAndFlush(
         _ response: Response<Body>, keepAlive: Bool
     ) async throws {
-        conn.encoder.encode(response, keepAlive: keepAlive, into: &conn.io.writeBuffer)
+        // Phase 1: write status + headers + buffered body (if any).
+        let head = conn.encoder.encodeHead(
+            response, keepAlive: keepAlive, into: &conn.io.writeBuffer
+        )
+        // Phase 2: streaming body — write each chunk in chunked TE format.
+        if case .stream = head {
+            for try await chunk in response.body.dataStream() {
+                conn.encoder.encodeChunk(chunk, into: &conn.io.writeBuffer)
+                try await conn.io.flush()
+            }
+            conn.encoder.encodeEndOfChunks(into: &conn.io.writeBuffer)
+        }
         try await conn.io.flush()
     }
 
