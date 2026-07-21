@@ -132,12 +132,20 @@ public struct H1Encoder: Sendable {
         // ── Empty line separating headers from body ───────────────
         buffer.append(contentsOf: Self.crlf)
 
-        // ── Buffered body: write it now ───────────────────────────
-        if case .buffered(let bytes) = response.body, !bytes.isEmpty {
-            buffer.append(contentsOf: bytes)
-            return .buffered
+        // ── Determine what the caller needs to do with the body ───
+        // NOTE: We do NOT append body bytes to `buffer`. The caller
+        // uses writev(2) to write header + body in one syscall
+        // without concatenation. This is the same pattern hyper uses
+        // with IoSlice + writev.
+        switch response.body {
+        case .empty:
+            return .noBody
+        case .buffered(let bytes):
+            if bytes.isEmpty { return .noBody }
+            return .buffered  // body exists but isn't copied into buffer
+        case .stream:
+            return .stream
         }
-        return isStreaming ? .stream : .noBody
     }
 
     // MARK: - Phase 2: streaming body chunks
