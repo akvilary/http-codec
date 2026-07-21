@@ -78,16 +78,17 @@ public enum H1DecodeError: Error, Sendable, Equatable {
 /// buffer; pipelined requests remain and the next `decode()` call
 /// processes them.
 ///
-/// Owned exclusively by the per-connection Task — same role as
-/// hyper's single `Conn` per connection. (Phase-2: make `~Copyable`
-/// to enforce this at compile time; v0.1 keeps it Copyable so it
-/// composes cleanly with `H1Conn<Io>`'s storage.)
+/// Uses `ReadBuffer` (Swift analogue of `bytes::BytesMut`) for
+/// zero-copy reads: the transport writes directly into the buffer's
+/// writable tail, the decoder parses from the readable region.
 public struct H1Decoder: Sendable {
-    /// Accumulated bytes, growing as `feed(_:)` is called.
-    @usableFromInline internal var buffer: [UInt8] = []
-    /// Read cursor — `buffer[0..<parsed]` has been consumed by the
-    /// current request, `buffer[parsed..<]` is yet to scan.
-    @usableFromInline internal var parsed: Int = 0
+    /// Accumulated bytes. ReadBuffer tracks read/write positions
+    /// internally — no separate `parsed` cursor needed.
+    ///
+    /// Public so the Worker can read directly into the writable tail
+    /// (zero-copy). Mirrors hyper's `BytesMut` being accessible from
+    /// the connection driver.
+    public let buffer: ReadBuffer
 
     /// Per-instance limits. Mirrors hyper's `h1_max_headers` /
     /// `max_buf_size` settings on a `Conn`.
@@ -97,29 +98,36 @@ public struct H1Decoder: Sendable {
     public init(maxRequestBytes: Int = 64 * 1024, maxHeaderCount: Int = 100) {
         self.maxRequestBytes = maxRequestBytes
         self.maxHeaderCount = maxHeaderCount
+        self.buffer = ReadBuffer(capacity: Swift.max(maxRequestBytes, 8192))
     }
 
     /// Append incoming bytes from a TCP read.
     @inlinable
-    public mutating func feed(_ bytes: [UInt8]) throws {
-        if buffer.count + bytes.count > maxRequestBytes {
-            buffer.removeAll(keepingCapacity: true)
-            parsed = 0
+    public func feed(_ bytes: [UInt8]) throws {
+        if buffer.readableBytes + bytes.count > maxRequestBytes {
+            buffer.reset()
             throw H1DecodeError.requestTooLarge
         }
-        buffer.append(contentsOf: bytes)
+        buffer.ensureCapacity(bytes.count)
+        bytes.withUnsafeBufferPointer { src in
+            let dst = buffer.writableTail
+            memcpy(dst.baseAddress!, src.baseAddress!, src.count)
+        }
+        buffer.advanceWritePosition(bytes.count)
     }
 
     /// Append incoming bytes from an unsafe buffer (zero-copy from the
     /// read loop's stack-allocated buffer).
     @inlinable
-    public mutating func feed(_ bytes: UnsafeBufferPointer<UInt8>) throws {
-        if buffer.count + bytes.count > maxRequestBytes {
-            buffer.removeAll(keepingCapacity: true)
-            parsed = 0
+    public func feed(_ bytes: UnsafeBufferPointer<UInt8>) throws {
+        if buffer.readableBytes + bytes.count > maxRequestBytes {
+            buffer.reset()
             throw H1DecodeError.requestTooLarge
         }
-        buffer.append(contentsOf: bytes)
+        buffer.ensureCapacity(bytes.count)
+        let dst = buffer.writableTail
+        memcpy(dst.baseAddress!, bytes.baseAddress!, bytes.count)
+        buffer.advanceWritePosition(bytes.count)
     }
 
     /// Try to parse one complete request from the buffered bytes.
@@ -130,24 +138,18 @@ public struct H1Decoder: Sendable {
     ///
     /// On `.needsMore`: leaves the buffer intact; caller must `feed`
     /// more bytes from the socket.
-    public mutating func decode() throws -> DecodeResult {
+    public func decode() throws -> DecodeResult {
         // Step 1: scan for the end of the headers block (\r\n\r\n).
         guard let headerEnd = findHeaderBlockEnd() else {
             return .needsMore
         }
         // Step 2: parse request line + headers from buffer[0..<headerEnd].
-        // Returns nil if the (chunked) body isn't fully in the buffer
-        // yet — caller should feed more bytes.
         guard let request = try parseRequestHeaders(upTo: headerEnd) else {
             return .needsMore
         }
         // Step 3: determine body length, read body bytes if any.
         let bodyEnd = try resolveBodyEnd(headersEnd: headerEnd, request: request)
-        guard buffer.count >= bodyEnd else {
-            // Headers parsed but body incomplete. Keep state and ask
-            // for more bytes — we'll re-parse on the next decode().
-            // (A more sophisticated impl would cache the parsed
-            //  headers and skip step 1-2 next time; phase-2 polish.)
+        guard buffer.readableBytes >= bodyEnd else {
             return .needsMore
         }
         // Step 4: extract body bytes and finalise Request.
@@ -156,9 +158,12 @@ public struct H1Decoder: Sendable {
             let bodyBytes = Array(buffer[headerEnd..<bodyEnd])
             finalRequest.body = .buffered(bodyBytes)
         }
-        // Step 5: consume parsed bytes, preserving pipelined tail.
-        buffer.removeFirst(bodyEnd)
-        parsed = 0
+        // Step 5: consume parsed bytes, compact for next read.
+        // For chunked: the consumed position was stashed in extensions
+        // by parseRequestHeaders. For Content-Length: bodyEnd covers it.
+        let totalConsumed = finalRequest.extensions.get(ChunkedBytesConsumed.self)?.value ?? bodyEnd
+        buffer.consume(totalConsumed)
+        buffer.compact()
         return .complete(finalRequest)
     }
 
@@ -173,19 +178,18 @@ public struct H1Decoder: Sendable {
     /// than byte-by-byte on typical HTTP header blocks.
     @inlinable
     internal func findHeaderBlockEnd() -> Int? {
-        guard buffer.count >= 4 else { return nil }
-        // Resume from `parsed` — the last position we scanned up to.
-        // Lets pipelined requests skip the already-consumed bytes.
-        let start = min(parsed, buffer.count - 3)
-        return buffer.withUnsafeBufferPointer { ptr in
-            ByteSearch.findCRLFCRLF(in: ptr, from: start, to: buffer.count)
-        }
+        guard buffer.readableBytes >= 4 else { return nil }
+        // ReadBuffer is always compacted before this call — readable
+        // region starts at index 0, so we scan from 0.
+        return ByteSearch.findCRLFCRLF(
+            in: buffer.readableBytesPtr, from: 0, to: buffer.readableBytes
+        )
     }
 
     /// Parse method + target + version + headers from the header block.
     /// Does NOT touch the body.
     @inlinable
-    internal mutating func parseRequestHeaders(upTo headerEnd: Int) throws -> Request<Body>? {
+    internal func parseRequestHeaders(upTo headerEnd: Int) throws -> Request<Body>? {
         var pos = 0
         // ── Request line ────────────────────────────────────────────
         // METHOD SP TARGET SP HTTP/x.y CRLF
@@ -330,7 +334,7 @@ public struct H1Decoder: Sendable {
             // `to_bytes(body, limit)`). True streaming request body
             // (Body.stream from a chunked source) is phase-2 polish.
             do {
-                let chunkedBytes = try parseChunkedBody(
+                let (chunkedBytes, consumedPos) = try parseChunkedBody(
                     headerEnd: headerEnd, headerIndex: headerIndex
                 )
                 var request = Request<Body>(
@@ -340,6 +344,9 @@ public struct H1Decoder: Sendable {
                     headers: headers,
                     body: .buffered(chunkedBytes)
                 )
+                // Stash consumed position so decode() knows how many
+                // bytes to consume from the buffer.
+                request.extensions.insert(ChunkedBytesConsumed(consumedPos))
                 return request
             } catch H1DecodeError.incompleteChunkedBody {
                 // Body not yet fully in the buffer — caller should
@@ -399,17 +406,17 @@ public struct H1Decoder: Sendable {
     /// if the buffer doesn't yet contain the full chunked body — the
     /// caller should `feed` more bytes and retry in the latter case.
     @usableFromInline
-    internal mutating func parseChunkedBody(headerEnd: Int, headerIndex: Int) throws -> [UInt8] {
+    internal func parseChunkedBody(headerEnd: Int, headerIndex: Int) throws -> (bytes: [UInt8], consumed: Int) {
         var pos = headerEnd
         var body: [UInt8] = []
 
-        chunkLoop: while pos < buffer.count {
+        chunkLoop: while pos < buffer.readableBytes {
             // ── Read hex chunk size ──────────────────────────────
             let sizeStart = pos
-            while pos < buffer.count && buffer[pos] != 0x0D && buffer[pos] != 0x3B {
+            while pos < buffer.readableBytes && buffer[pos] != 0x0D && buffer[pos] != 0x3B {
                 pos &+= 1  // scan until CR or ';' (chunk-ext)
             }
-            guard pos < buffer.count else {
+            guard pos < buffer.readableBytes else {
                 throw H1DecodeError.incompleteChunkedBody
             }
             // Parse hex size.
@@ -420,12 +427,12 @@ public struct H1Decoder: Sendable {
                 throw H1DecodeError.malformedChunkSize
             }
             // Skip chunk-ext (anything until CRLF).
-            while pos + 1 < buffer.count,
+            while pos + 1 < buffer.readableBytes,
                   !(buffer[pos] == 0x0D && buffer[pos + 1] == 0x0A) {
                 pos &+= 1
             }
             // Consume CRLF after size.
-            guard pos + 1 < buffer.count,
+            guard pos + 1 < buffer.readableBytes,
                   buffer[pos] == 0x0D, buffer[pos + 1] == 0x0A
             else { throw H1DecodeError.malformedChunkSize }
             pos &+= 2
@@ -433,23 +440,23 @@ public struct H1Decoder: Sendable {
             // ── Last-chunk (size 0) → end of body ────────────────
             if chunkSize == 0 {
                 // Skip optional trailer-part + final CRLF.
-                while pos + 1 < buffer.count,
+                while pos + 1 < buffer.readableBytes,
                       !(buffer[pos] == 0x0D && buffer[pos + 1] == 0x0A) {
                     pos &+= 1
                 }
                 // Consume final CRLF.
-                if pos + 1 < buffer.count,
+                if pos + 1 < buffer.readableBytes,
                    buffer[pos] == 0x0D, buffer[pos + 1] == 0x0A {
                     pos &+= 2
                 }
-                // Update `parsed` so the codec consumes the entire
-                // chunked body when it discardUsedBytes().
-                parsed = pos
-                return body
+                // Return body bytes + consumed position (headers + all chunks).
+                // decode() handles the actual buffer.consume() — avoids
+                // double consumption.
+                return (body, pos)
             }
 
             // ── Read chunk-data + trailing CRLF ──────────────────
-            guard pos + chunkSize + 1 < buffer.count else {
+            guard pos + chunkSize + 1 < buffer.readableBytes else {
                 throw H1DecodeError.incompleteChunkedBody
             }
             body.append(contentsOf: buffer[pos..<(pos + chunkSize)])
@@ -491,9 +498,7 @@ public struct H1Decoder: Sendable {
     /// Scans 8 bytes per iteration; ~5× faster than naive loop.
     @inlinable
     internal func findByte(_ needle: UInt8, from start: Int, upto end: Int) -> Int? {
-        buffer.withUnsafeBufferPointer { ptr in
-            ByteSearch.findByte(needle, in: ptr, from: start, to: end)
-        }
+        ByteSearch.findByte(needle, in: buffer.readableBytesPtr, from: start, to: end)
     }
 
     /// Case-insensitive ASCII compare against "content-length".
@@ -552,4 +557,12 @@ public struct H1Decoder: Sendable {
 public struct ParsedContentLength: Hashable, Sendable {
     public let length: Int
     @inlinable public init(length: Int) { self.length = length }
+}
+
+/// Extension-scoped carrier for the total bytes consumed by a chunked
+/// body parse (headers + all chunks + terminating 0-chunk). Used by
+/// decode() to consume the correct number of bytes from ReadBuffer.
+public struct ChunkedBytesConsumed: Hashable, Sendable {
+    public let value: Int
+    @inlinable public init(_ value: Int) { self.value = value }
 }
