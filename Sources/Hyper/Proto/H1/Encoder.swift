@@ -74,7 +74,7 @@ public struct H1Encoder: Sendable {
     /// `.noBody`.
     @discardableResult
     public func encodeHead(
-        _ response: Response<Body>,
+        _ response: Response,
         keepAlive: Bool,
         into buffer: inout [UInt8]
     ) -> EncodedHead {

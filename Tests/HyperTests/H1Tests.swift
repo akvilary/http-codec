@@ -101,7 +101,7 @@ struct H1EncodeTests {
     func encodeBasic() throws {
         let encoder = H1Encoder()
         var buffer: [UInt8] = []
-        let response = Response<Body>(
+        let response = Response(
             status: .ok,
             headers: HeaderMap(),
             body: Body([0x68, 0x69])  // "hi"
@@ -121,7 +121,7 @@ struct H1EncodeTests {
     func encodeClose() throws {
         let encoder = H1Encoder()
         var buffer: [UInt8] = []
-        let response = Response<Body>(status: .notFound, body: Body("nope"))
+        let response = Response(status: .notFound, body: Body("nope"))
         encoder.encodeHead(response, keepAlive: false, into: &buffer)
         let s = String(decoding: buffer, as: UTF8.self)
         #expect(s.hasPrefix("HTTP/1.1 404 Not Found\r\n"))

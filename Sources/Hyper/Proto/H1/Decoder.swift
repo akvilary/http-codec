@@ -17,7 +17,7 @@
 //
 //  The decoder is fed bytes incrementally via `feed(_:)`; it returns
 //  `.needsMore` when the buffer doesn't yet contain a complete
-//  request, `.complete(Request<Body>)` when one is parsed, or throws
+//  request, `.complete(Request)` when one is parsed, or throws
 //  `H1DecodeError` on malformed input.
 //
 //  Mirrors hyper::proto::h1::Conn::poll_read_head + httparse::ParserConfig.
@@ -30,7 +30,7 @@ import HTTP
 /// Result of a single `feed(_:)` call.
 public enum DecodeResult {
     /// The accumulator now contains a complete request.
-    case complete(Request<Body>)
+    case complete(Request)
     /// More bytes are needed — caller should `read` from the socket
     /// and `feed` again.
     case needsMore
@@ -178,7 +178,7 @@ public struct H1Decoder: Sendable {
     /// Parse method + target + version + headers from the header block.
     /// Does NOT touch the body.
     @inlinable
-    internal mutating func parseRequestHeaders(upTo headerEnd: Int) throws -> Request<Body>? {
+    internal mutating func parseRequestHeaders(upTo headerEnd: Int) throws -> Request? {
         var pos = 0
         // ── Request line ────────────────────────────────────────────
         // METHOD SP TARGET SP HTTP/x.y CRLF
@@ -330,7 +330,7 @@ public struct H1Decoder: Sendable {
                     headerEnd: headerEnd, headerIndex: headerIndex
                 )
                 reusableExtensions.removeAll()
-                var request = Request<Body>(
+                var request = Request(
                     method: method,
                     uri: uri,
                     version: version,
@@ -351,7 +351,7 @@ public struct H1Decoder: Sendable {
         // Reuse Extensions — clear storage but preserve capacity.
         reusableExtensions.removeAll()
 
-        var request = Request<Body>(
+        var request = Request(
             method: method,
             uri: uri,
             version: version,
@@ -367,7 +367,7 @@ public struct H1Decoder: Sendable {
 
     /// Determine the end offset of the body, given the parsed headers.
     @inlinable
-    internal func resolveBodyEnd(headersEnd: Int, request: Request<Body>) throws -> Int {
+    internal func resolveBodyEnd(headersEnd: Int, request: Request) throws -> Int {
         // Body length determined by Content-Length only (chunked already
         // rejected above). No Content-Length → no body for requests
         // (RFC 9112 §6.3 — server-side, requests default to no body).

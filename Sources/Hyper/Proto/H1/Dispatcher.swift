@@ -5,7 +5,7 @@
 //
 //  Port of `hyper::proto::h1::dispatch::Dispatcher`. Drives a `Conn`
 //  through the read/parse/dispatch/write cycle, calling into a
-//  user-provided `Service<Request<Body>>` for each request.
+//  user-provided `Service<Request>` for each request.
 //
 //===----------------------------------------------------------------------===//
 
@@ -13,10 +13,10 @@ import Foundation
 import HTTP
 
 /// The dispatcher's per-request callback shape. Mirrors
-/// `tower::Service<Request, Response = Response<Body>>` but kept
+/// `tower::Service<Request, Response = Response>` but kept
 /// closure-based for ergonomics — the Starlight layer will wrap
 /// any `Service`-conforming type into this closure shape.
-public typealias HandleRequest = @Sendable (Request<Body>) async throws -> Response<Body>
+public typealias HandleRequest = @Sendable (Request) async throws -> Response
 
 /// Drives an HTTP/1.1 connection through the read/parse/dispatch/write
 /// cycle. Direct port of `hyper::proto::h1::dispatch::Dispatcher`.
@@ -58,7 +58,7 @@ public struct H1Dispatcher<Io: AsyncReadWrite>: Sendable {
     /// Read bytes until the decoder returns `.complete(request)`.
     /// Returns `nil` on graceful EOF (peer closed before sending any
     /// data on a fresh connection).
-    private func readHead() async throws -> Request<Body>? {
+    private func readHead() async throws -> Request? {
         while true {
             switch try conn.decoder.decode() {
             case .complete(let request):
@@ -82,7 +82,7 @@ public struct H1Dispatcher<Io: AsyncReadWrite>: Sendable {
 
     /// Encode the response and flush to the transport.
     private func encodeAndFlush(
-        _ response: Response<Body>, keepAlive: Bool
+        _ response: Response, keepAlive: Bool
     ) async throws {
         // Phase 1: write status + headers + buffered body (if any).
         let head = conn.encoder.encodeHead(

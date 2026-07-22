@@ -23,7 +23,7 @@ public enum ServerTransaction {
     /// Mirrors hyper::proto::h1::Server::keep_alive.
     public static func shouldKeepAlive(
         version: Version,
-        response: Response<Body>,
+        response: Response,
         explicitConnection: HeaderValue?
     ) -> Bool {
         // 1xx, 204, 304 are bodyless intermediates — keep-alive is fine.
