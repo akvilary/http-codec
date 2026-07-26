@@ -382,6 +382,12 @@ public struct H1Decoder: Sendable {
             throw H1DecodeError.missingHost
         }
 
+        // ── Strip hop-by-hop headers (RFC 9110 §7.6.1) ──────────────
+        // Connection, Keep-Alive, TE, Trailer, Transfer-Encoding,
+        // Upgrade, Proxy-Connection are per-connection — handlers
+        // must not see them.
+        reusableHeaders.entries.removeAll { (name, _) in name.isHopByHop() }
+
         // ── Body framing selection ─────────────────────────────────
         //
         // Reject CL + TE conflict outright (RFC 9112 §6.3.6 permits

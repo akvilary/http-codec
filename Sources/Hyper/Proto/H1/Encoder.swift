@@ -125,8 +125,12 @@ public struct H1Encoder: Sendable {
             }
         }
 
-        // ── Write user headers ────────────────────────────────────
+        // ── Write user headers (skip hop-by-hop) ──────────────────
+        // Hop-by-hop headers (Connection, Keep-Alive, etc.) are
+        // per-connection — the encoder manages them itself. Handler-
+        // set hop-by-hop headers are silently dropped.
         for (name, value) in response.headers.entries {
+            if name.isHopByHop() { continue }
             writeHeaderName(name, into: &buffer)
             buffer.append(0x3A)
             buffer.append(0x20)
