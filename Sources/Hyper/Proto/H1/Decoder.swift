@@ -106,10 +106,16 @@ public struct H1Decoder: Sendable {
 
     public let maxRequestBytes: Int
     public let maxHeaderCount: Int
+    public let maxBodyBytes: Int
 
-    public init(maxRequestBytes: Int = 64 * 1024, maxHeaderCount: Int = 100) {
+    public init(
+        maxRequestBytes: Int = 64 * 1024,
+        maxHeaderCount: Int = 100,
+        maxBodyBytes: Int = 2 * 1024 * 1024  // 2 MB, matching DefaultBodyLimit
+    ) {
         self.maxRequestBytes = maxRequestBytes
         self.maxHeaderCount = maxHeaderCount
+        self.maxBodyBytes = maxBodyBytes
     }
 
     // MARK: - Feed
@@ -540,6 +546,11 @@ public struct H1Decoder: Sendable {
             guard pos + chunkSize + 1 < buffer.count else {
                 throw H1DecodeError.incompleteChunkedBody
             }
+            // Pre-check total body size BEFORE appending — prevents
+            // allocating a huge chunk that would immediately be rejected.
+            if body.count + chunkSize > maxBodyBytes {
+                throw H1DecodeError.requestTooLarge
+            }
             body.append(contentsOf: buffer[pos..<(pos + chunkSize)])
             pos &+= chunkSize
             // Consume CRLF after data.
@@ -553,10 +564,16 @@ public struct H1Decoder: Sendable {
     }
 
     /// Parse an ASCII hex string into an Int. Returns `nil` on invalid
-    /// digits or overflow.
+    /// digits or if the value exceeds the 1 GiB per-chunk cap.
+    ///
+    /// Overflow-safe on all architectures (32-bit and 64-bit). The
+    /// pre-check `result > (maxChunkSize - digit) / 16` catches
+    /// values that would overflow or exceed the cap BEFORE the
+    /// multiply, preventing Swift's trap-on-overflow.
     @inlinable
     internal static func parseHex<S: Sequence>(_ bytes: S) -> Int?
     where S.Element == UInt8 {
+        let maxChunkSize = 1024 * 1024 * 1024  // 1 GiB per chunk
         var result = 0
         for b in bytes {
             let digit: Int
@@ -566,8 +583,12 @@ public struct H1Decoder: Sendable {
             case 0x61...0x66: digit = Int(b - 0x61 + 10)   // a-f
             default: return nil
             }
+            // Pre-check: result * 16 + digit must not exceed maxChunkSize.
+            // Rearranged to avoid overflow: result <= (max - digit) / 16.
+            // Safe on all architectures: max - digit is always positive
+            // (max = 1 GiB, digit ≤ 15), and the division result fits Int32.
+            if result > (maxChunkSize - digit) / 16 { return nil }
             result = result * 16 + digit
-            if result < 0 || result > 1024 * 1024 * 1024 { return nil }  // 1 GiB cap
         }
         return result
     }
