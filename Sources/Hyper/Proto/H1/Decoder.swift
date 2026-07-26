@@ -68,6 +68,19 @@ public enum H1DecodeError: Error, Sendable, Equatable {
     /// A chunked body needs more bytes — the buffer doesn't yet contain
     /// the terminating 0-chunk. Caller should `feed` more and retry.
     case incompleteChunkedBody
+    /// A header value contained a bare CR (0x0D) or LF (0x0A) that is
+    /// not part of a CRLF pair. RFC 9112 §5.1 forbids this; accepting
+    /// it enables header-injection / request-smuggling attacks.
+    case bareCrLfInHeader(line: Int)
+    /// An HTTP/1.1 request without a Host header. RFC 9112 §3.2
+    /// mandates that a server MUST respond 400.
+    case missingHost
+    /// Both `Content-Length` and `Transfer-Encoding: chunked` were
+    /// present. RFC 9112 §6.3.6 permits resolving this in favour of
+    /// chunked, but modern secure implementations reject with 400
+    /// because the disagreement between stacks is the root cause of
+    /// CL.TE / TE.CL request smuggling.
+    case conflictingFraming
 }
 
 /// HTTP/1.1 incremental request decoder.
@@ -234,6 +247,7 @@ public struct H1Decoder: Sendable {
         var contentLength: Int? = nil
         var contentLengthCount = 0
         var transferEncodingSeen = false
+        var seenHost = false  // tracked inline — avoids post-parse scan
 
         while pos < headerEnd - 2 {  // stop before final \r\n
             // Empty line means end of headers — but our `headerEnd`
@@ -267,9 +281,20 @@ public struct H1Decoder: Sendable {
             while pos < headerEnd && (buffer[pos] == 0x20 || buffer[pos] == 0x09) {
                 pos &+= 1
             }
-            // Value: bytes up to CRLF.
+            // Value: scan byte-by-byte until CRLF. Reject bare CR or LF
+            // inline (RFC 9112 §5.1) — this is the smuggling guard. For
+            // well-formed traffic the extra branch is predicted not-taken
+            // and costs ~0 cycles; it replaces a separate O(n) pass.
             let valueStart = pos
-            while pos < headerEnd - 1 && !(buffer[pos] == 0x0D && buffer[pos + 1] == 0x0A) {
+            scanLoop: while pos < headerEnd - 1 {
+                let b = buffer[pos]
+                if b == 0x0D {
+                    if buffer[pos + 1] == 0x0A { break scanLoop }  // CRLF — end
+                    throw H1DecodeError.bareCrLfInHeader(line: headerIndex)  // bare CR
+                }
+                if b == 0x0A {
+                    throw H1DecodeError.bareCrLfInHeader(line: headerIndex)  // bare LF
+                }
                 pos &+= 1
             }
             // Trim trailing whitespace.
@@ -282,8 +307,9 @@ public struct H1Decoder: Sendable {
             let value = HeaderValue(bytes: valueBytes)
             reusableHeaders.append(name, value)
 
-            // Track content-length / transfer-encoding for body parsing.
-            // Compare against lowercased ASCII bytes — constant-time-ish.
+            // Track content-length / transfer-encoding / host for body
+            // parsing + HTTP/1.1 compliance. Compared inline during the
+            // existing scan — zero extra passes over the header set.
             if Self.isContentLength(nameBytes) {
                 contentLengthCount &+= 1
                 guard let n = Int(String(decoding: valueBytes, as: UTF8.self)), n >= 0 else {
@@ -294,13 +320,47 @@ public struct H1Decoder: Sendable {
                 }
                 contentLength = n
             } else if Self.isTransferEncoding(nameBytes) {
+                // RFC 9112 §7.2.1: chunked must be the LAST codeword
+                // in the Transfer-Encoding list. Split on comma, trim
+                // OWS per element, compare last token case-insensitively
+                // against "chunked". This rejects "xchunked",
+                // "chunked-experimental", etc.
+                //
+                // Performance: the lowercased value is already a small
+                // array (typically "chunked" alone). The comma-split
+                // loop touches each byte once — same order as the old
+                // substring search, but with exact matching.
                 let lower = valueBytes.map {
                     (0x41...0x5A).contains($0) ? $0 + 0x20 : $0
                 }
-                // Look for "chunked" anywhere in the value (case-insensitive).
-                if Self.containsSubstring(lower, pattern: [0x63, 0x68, 0x75, 0x6E, 0x6B, 0x65, 0x64]) {
-                    transferEncodingSeen = true
+                // Find the last comma — everything after it is the
+                // last codeword.
+                var lastComma: Int? = nil
+                for i in 0..<lower.count where lower[i] == 0x2C {  // ','
+                    lastComma = i
                 }
+                let tokenStart = (lastComma ?? -1) + 1
+                // Trim trailing OWS (0x20 / 0x09) from the token.
+                var tokenEnd = lower.count
+                while tokenEnd > tokenStart && (lower[tokenEnd - 1] == 0x20 || lower[tokenEnd - 1] == 0x09) {
+                    tokenEnd &-= 1
+                }
+                // Also trim leading OWS after the comma.
+                var s = tokenStart
+                while s < tokenEnd && (lower[s] == 0x20 || lower[s] == 0x09) {
+                    s &+= 1
+                }
+                // Exact compare against "chunked" (7 bytes).
+                let chunked: [UInt8] = [0x63, 0x68, 0x75, 0x6E, 0x6B, 0x65, 0x64]
+                if tokenEnd - s == chunked.count {
+                    var match = true
+                    for i in 0..<chunked.count where lower[s + i] != chunked[i] {
+                        match = false; break
+                    }
+                    if match { transferEncodingSeen = true }
+                }
+            } else if !seenHost && Self.isHost(nameBytes) {
+                seenHost = true
             }
 
             // Consume CRLF.
@@ -308,6 +368,22 @@ public struct H1Decoder: Sendable {
                   buffer[pos] == 0x0D, buffer[pos + 1] == 0x0A
             else { throw H1DecodeError.malformedHeader(line: headerIndex) }
             pos &+= 2
+        }
+
+        // ── HTTP/1.1 Host header check (RFC 9112 §3.2) ──────────────
+        // Tracked inline during the header loop — no post-parse scan.
+        if version == .http11 && !seenHost {
+            throw H1DecodeError.missingHost
+        }
+
+        // ── Body framing selection ─────────────────────────────────
+        //
+        // Reject CL + TE conflict outright (RFC 9112 §6.3.6 permits
+        // chunked preference, but the disagreement between stacks is
+        // the root of CL.TE / TE.CL request smuggling). This matches
+        // the posture of modern secure HTTP implementations.
+        if transferEncodingSeen && contentLength != nil {
+            throw H1DecodeError.conflictingFraming
         }
 
         if transferEncodingSeen {
@@ -432,20 +508,32 @@ public struct H1Decoder: Sendable {
 
             // ── Last-chunk (size 0) → end of body ────────────────
             if chunkSize == 0 {
-                // Skip optional trailer-part + final CRLF.
-                while pos + 1 < buffer.count,
-                      !(buffer[pos] == 0x0D && buffer[pos + 1] == 0x0A) {
-                    pos &+= 1
+                // Trailer block grammar (RFC 9112 §7.1):
+                //   trailer-part = *( header-field CRLF )
+                // The block is terminated by an empty line (CRLF).
+                // Scan until we find that empty line, skipping over
+                // any trailer header lines.
+                trailerLoop: while true {
+                    // Need at least 2 bytes to check for CRLF.
+                    guard pos + 1 < buffer.count else {
+                        throw H1DecodeError.incompleteChunkedBody
+                    }
+                    // Empty line (CRLF) → end of trailer block.
+                    if buffer[pos] == 0x0D && buffer[pos + 1] == 0x0A {
+                        pos &+= 2
+                        return (body, pos)
+                    }
+                    // Not empty — this is a trailer header line.
+                    // Skip to its terminating CRLF.
+                    while pos + 1 < buffer.count,
+                          !(buffer[pos] == 0x0D && buffer[pos + 1] == 0x0A) {
+                        pos &+= 1
+                    }
+                    guard pos + 1 < buffer.count,
+                          buffer[pos] == 0x0D, buffer[pos + 1] == 0x0A
+                    else { throw H1DecodeError.incompleteChunkedBody }
+                    pos &+= 2  // consume trailer header CRLF
                 }
-                // Consume final CRLF.
-                if pos + 1 < buffer.count,
-                   buffer[pos] == 0x0D, buffer[pos + 1] == 0x0A {
-                    pos &+= 2
-                }
-                // Return body bytes + consumed position (headers + all chunks).
-                // decode() handles the actual removeFirst — avoids
-                // double consumption.
-                return (body, pos)
             }
 
             // ── Read chunk-data + trailing CRLF ──────────────────
@@ -528,6 +616,18 @@ public struct H1Decoder: Sendable {
             i &+= 1
         }
         return true
+    }
+
+    /// Case-insensitive ASCII compare against "host" (4 bytes).
+    /// Short-circuits on length first — most header names differ in
+    /// length, making this ~1 comparison for the common case.
+    @inlinable
+    internal static func isHost(_ name: ArraySlice<UInt8>) -> Bool {
+        name.count == 4
+            && (name[name.startIndex] | 0x20) == 0x68     // h
+            && (name[name.startIndex + 1] | 0x20) == 0x6F // o
+            && (name[name.startIndex + 2] | 0x20) == 0x73 // s
+            && (name[name.startIndex + 3] | 0x20) == 0x74 // t
     }
 
     /// Naive substring search — used only on header values, which are

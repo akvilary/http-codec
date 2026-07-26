@@ -70,15 +70,34 @@ public struct H1Encoder: Sendable {
     /// returns `.stream`. Caller must follow up with `encodeChunk`
     /// and `encodeEndOfChunks`.
     ///
-    /// For `.empty` body (or HEAD response): writes headers, returns
-    /// `.noBody`.
+    /// For `.empty` body (or HEAD response, or 1xx/204/304 status):
+    /// writes headers, returns `.noBody`.
+    ///
+    /// - Parameter requestMethod: The HTTP method of the request that
+    ///   triggered this response. Needed because HEAD responses must
+    ///   suppress the body (RFC 9110 §9.3.2) while preserving the
+    ///   Content-Length that GET would have produced. Defaults to GET
+    ///   for backward compatibility with callers that don't track the
+    ///   method.
     @discardableResult
     public func encodeHead(
         _ response: Response,
         keepAlive: Bool,
+        requestMethod: Method = .GET,
         into buffer: inout [UInt8]
     ) -> EncodedHead {
         let start = buffer.count
+
+        // ── Determine whether the body must be suppressed ─────────
+        //
+        // RFC 9110 §9.3.2: HEAD responses MUST NOT include a body.
+        // RFC 9110 §15.2.1, §15.4.5, §15.4.7: 1xx, 204, 304 responses
+        // MUST NOT include a body.
+        let isHeadResponse = requestMethod == .HEAD
+        let isBodyForbidden = isHeadResponse
+            || response.status.code < 200
+            || response.status.code == 204
+            || response.status.code == 304
 
         // ── Status line ───────────────────────────────────────────
         writeStatusLine(response.status, into: &buffer)
@@ -96,10 +115,14 @@ public struct H1Encoder: Sendable {
         }
 
         let isStreaming: Bool
-        switch response.body {
-        case .empty:        isStreaming = false
-        case .buffered:     isStreaming = false
-        case .stream:       isStreaming = true
+        if isBodyForbidden {
+            isStreaming = false
+        } else {
+            switch response.body {
+            case .empty:        isStreaming = false
+            case .buffered:     isStreaming = false
+            case .stream:       isStreaming = true
+            }
         }
 
         // ── Write user headers ────────────────────────────────────
@@ -137,6 +160,13 @@ public struct H1Encoder: Sendable {
         // uses writev(2) to write header + body in one syscall
         // without concatenation. This is the same pattern hyper uses
         // with IoSlice + writev.
+        // Body-decision: suppress body entirely for HEAD / 1xx / 204 / 304.
+        // The auto-framing headers (Content-Length / TE) are still emitted
+        // above so the client knows what GET would have produced — but the
+        // caller must NOT write any body bytes.
+        if isBodyForbidden {
+            return .noBody
+        }
         switch response.body {
         case .empty:
             return .noBody
