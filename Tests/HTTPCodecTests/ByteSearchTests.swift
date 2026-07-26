@@ -9,7 +9,7 @@
 
 import Testing
 import Foundation
-@testable import Hyper
+@testable import HTTPCodec
 
 @Suite("SWAR ByteSearch")
 struct ByteSearchTests {

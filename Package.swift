@@ -37,7 +37,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "hyper",
+    name: "http-codec",
     platforms: [
         .macOS(.v15),
         .iOS(.v18),
@@ -45,7 +45,7 @@ let package = Package(
         .watchOS(.v11),
     ],
     products: [
-        .library(name: "Hyper", targets: ["Hyper"]),
+        .library(name: "HTTPCodec", targets: ["HTTPCodec"]),
     ],
     dependencies: [
         // Swift port of the `http` crate — Request/Response/Method/
@@ -54,17 +54,17 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "Hyper",
+            name: "HTTPCodec",
             dependencies: [
                 .product(name: "HTTP", package: "http"),
             ],
-            path: "Sources/Hyper",
+            path: "Sources/HTTPCodec",
             swiftSettings: baseSwiftSettings
         ),
         .testTarget(
-            name: "HyperTests",
-            dependencies: ["Hyper"],
-            path: "Tests/HyperTests",
+            name: "HTTPCodecTests",
+            dependencies: ["HTTPCodec"],
+            path: "Tests/HTTPCodecTests",
             swiftSettings: baseSwiftSettings
         ),
     ]

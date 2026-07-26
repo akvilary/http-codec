@@ -8,7 +8,7 @@
 import Testing
 import Foundation
 import HTTP
-@testable import Hyper
+@testable import HTTPCodec
 
 @Suite("H1 Decoder")
 struct H1DecodeTests {
