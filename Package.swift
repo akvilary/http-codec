@@ -50,7 +50,7 @@ let package = Package(
     dependencies: [
         // Swift port of the `http` crate — Request/Response/Method/
         // StatusCode/HeaderMap/Uri/Version.
-        .package(path: "../http"),
+        .package(url: "https://github.com/akvilary/http.git", from: "0.1.0"),
     ],
     targets: [
         .target(
