@@ -60,6 +60,9 @@ public enum ByteSearch {
             while i + 8 <= end {
                 var chunk: UInt64 = 0
                 memcpy(&chunk, base.advanced(by: i), 8)
+                #if _endian(big)
+                chunk = chunk.byteSwapped
+                #endif
                 let x = chunk ^ pattern
                 // has-zero-byte: ((x - 0x01...) & ~x & 0x80...) != 0
                 let y = (x &- 0x0101_0101_0101_0101) & ~x & 0x8080_8080_8080_8080
@@ -108,6 +111,9 @@ public enum ByteSearch {
         while i + 8 <= end {
             var chunk: UInt64 = 0
             memcpy(&chunk, base.advanced(by: i), 8)
+            #if _endian(big)
+            chunk = chunk.byteSwapped
+            #endif
             let x = chunk ^ pattern
             var y = (x &- 0x0101_0101_0101_0101) & ~x & 0x8080_8080_8080_8080
 
@@ -160,6 +166,9 @@ public enum ByteSearch {
         while i + 8 <= end {
             var chunk: UInt64 = 0
             memcpy(&chunk, base.advanced(by: i), 8)
+            #if _endian(big)
+            chunk = chunk.byteSwapped
+            #endif
             let x = chunk ^ pattern
             var y = (x &- 0x0101_0101_0101_0101) & ~x & 0x8080_8080_8080_8080
 
