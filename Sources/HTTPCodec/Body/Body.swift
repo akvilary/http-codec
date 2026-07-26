@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
 //
 //  Body.swift / Frame.swift
-//  Hyper/Body
+//  HTTPCodec/Body
 //
 //  Port of `hyper::body` + `http_body::Body`. The body model that
 //  flows through the codec: streaming-capable, frame-oriented.
@@ -35,7 +35,7 @@ public enum Frame<Data: Sendable>: Sendable {
 ///
 /// Mirrors `hyper::body::Body` (which itself wraps an internal enum
 /// over `Incoming`, `Sender`-channel, and concrete impls).
-public enum HyperBody: Sendable {
+public enum HTTPCodecBody: Sendable {
     case empty
     case buffered([UInt8])
     case stream(any AsyncSequence<[UInt8], Error> & Sendable)

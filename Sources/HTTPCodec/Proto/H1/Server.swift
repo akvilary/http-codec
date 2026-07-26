@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
 //
 //  Server.swift
-//  Hyper/Proto/H1
+//  HTTPCodec/Proto/H1
 //
 //  Port of `hyper::proto::h1::role::Server` (the server-side
 //  `Http1Transaction` implementation).

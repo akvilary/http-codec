@@ -17,7 +17,7 @@ import HTTP
 /// The error is `Sendable` so it can be propagated across Task boundaries
 /// (e.g. when the dispatcher catches an IO error and surfaces it to the
 /// accept loop).
-public struct HyperError: Error, Sendable, CustomStringConvertible {
+public struct HTTPCodecError: Error, Sendable, CustomStringConvertible {
     public let kind: Kind
     public let underlying: (any Error & Sendable)?
 
@@ -53,21 +53,21 @@ public struct HyperError: Error, Sendable, CustomStringConvertible {
 
     public var description: String {
         switch kind {
-        case .parse(let s):        return "hyper parse error: \(s)"
-        case .incomplete:          return "hyper: connection closed mid-message"
-        case .headerTimeout:       return "hyper: header read timeout"
-        case .bodyTimeout:         return "hyper: body read timeout"
-        case .connectionReset:     return "hyper: connection reset by peer"
-        case .io(let errno):       return "hyper: I/O error (errno \(errno))"
-        case .tooLarge:            return "hyper: request too large"
-        case .unexpectedContinue:  return "hyper: unexpected 100-continue"
-        case .versionMismatch:     return "hyper: HTTP version mismatch"
-        case .internal:            return "hyper: internal invariant violated"
+        case .parse(let s):        return "http-codec parse error: \(s)"
+        case .incomplete:          return "http-codec: connection closed mid-message"
+        case .headerTimeout:       return "http-codec: header read timeout"
+        case .bodyTimeout:         return "http-codec: body read timeout"
+        case .connectionReset:     return "http-codec: connection reset by peer"
+        case .io(let errno):       return "http-codec: I/O error (errno \(errno))"
+        case .tooLarge:            return "http-codec: request too large"
+        case .unexpectedContinue:  return "http-codec: unexpected 100-continue"
+        case .versionMismatch:     return "http-codec: HTTP version mismatch"
+        case .internal:            return "http-codec: internal invariant violated"
         }
     }
 }
 
-extension HyperError {
+extension HTTPCodecError {
     /// `true` if this error originated from parsing the wire bytes.
     @inlinable public var isParse: Bool {
         if case .parse = kind { return true } else { return false }

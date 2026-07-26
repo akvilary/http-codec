@@ -1,13 +1,13 @@
 //===----------------------------------------------------------------------===//
 //
-//  Hyper.swift
-//  Hyper
+//  HTTPCodec.swift
+//  HTTPCodec
 //
 //  lib.rs — module prelude + public re-exports.
 //
 //  Direct port of `hyper::lib` (https://docs.rs/hyper). The crate
 //  re-exports the public surface of every submodule so users do
-//  `import Hyper` and access everything as `Hyper.Body`, `Hyper.Conn`,
+//  `import HTTPCodec` and access everything as `Hyper.Body`, `Hyper.Conn`,
 //  etc.
 //
 //===----------------------------------------------------------------------===//

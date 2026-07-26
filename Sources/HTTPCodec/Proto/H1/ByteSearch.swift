@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
 //
 //  ByteSearch.swift
-//  Hyper/Proto/H1
+//  HTTPCodec/Proto/H1
 //
 //  SWAR-accelerated byte-search primitives. Port of the technique
 //  used by `bytes::Find` (which underlies hyper's parser) and

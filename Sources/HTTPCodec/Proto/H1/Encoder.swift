@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
 //
 //  Encoder.swift
-//  Hyper/Proto/H1
+//  HTTPCodec/Proto/H1
 //
 //  Port of `hyper::proto::h1::Encoder`. Serialises an HTTP/1.1
 //  response in two phases:

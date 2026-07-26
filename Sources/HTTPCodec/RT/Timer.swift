@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
 //
 //  Timer.swift
-//  Hyper/RT
+//  HTTPCodec/RT
 //
 //  Port of `hyper::rt::Timer`. A sleep/wait abstraction the codec
 //  uses for header/body timeouts.
