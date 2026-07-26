@@ -108,6 +108,27 @@ public struct H1Decoder: Sendable {
     public let maxHeaderCount: Int
     public let maxBodyBytes: Int
 
+    /// Set to true when the decoder has parsed complete headers with
+    /// `Expect: 100-continue` but the body is not yet fully buffered.
+    /// The caller (Worker) should write the interim 100 Continue
+    /// response, then call `clearPendingContinue()`.
+    @usableFromInline internal var _pendingContinue = false
+
+    /// Guard: once true, prevents re-signaling 100 Continue for the
+    /// same request (body may arrive in multiple reads). Reset when
+    /// `decode()` returns `.complete`.
+    @usableFromInline internal var _continueSent = false
+
+    /// `true` if the caller should send `HTTP/1.1 100 Continue` to
+    /// the client before waiting for more body bytes.
+    public var pendingContinue: Bool { _pendingContinue }
+
+    /// Clear the pending-continue signal after the caller has written
+    /// the 100 Continue response.
+    public mutating func clearPendingContinue() {
+        _pendingContinue = false
+    }
+
     public init(
         maxRequestBytes: Int = 64 * 1024,
         maxHeaderCount: Int = 100,
@@ -162,6 +183,17 @@ public struct H1Decoder: Sendable {
         // Step 3: determine body length, read body bytes if any.
         let bodyEnd = try resolveBodyEnd(headersEnd: headerEnd, request: request)
         guard buffer.count >= bodyEnd else {
+            // Body not yet fully buffered. If the client sent
+            // `Expect: 100-continue`, signal the caller to send the
+            // interim 100 Continue response so the client proceeds
+            // with the body (RFC 9110 §10.1.1). Only signaled once
+            // per request via the _continueSent guard.
+            if !_continueSent,
+               request.headers.first(for: .expect)?.description.lowercased()
+                == "100-continue" {
+                _pendingContinue = true
+                _continueSent = true
+            }
             return .needsMore
         }
         // Step 4: extract body bytes and finalise Request.
@@ -174,6 +206,7 @@ public struct H1Decoder: Sendable {
         // backing storage capacity for keep-alive reuse.
         let totalConsumed = finalRequest.extensions.get(ChunkedBytesConsumed.self)?.value ?? bodyEnd
         buffer.removeFirst(totalConsumed)
+        _continueSent = false  // reset for next keep-alive request
         return .complete(finalRequest)
     }
 
