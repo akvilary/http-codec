@@ -66,15 +66,8 @@ public enum ByteSearch {
                 if y != 0 {
                     // Found. trailingZeroBitCount gives the bit index of
                     // the lowest set bit; divide by 8 to get byte offset
-                    // within the chunk. On little-endian (x86_64, arm64
-                    // in LE mode) byte 0 is the least-significant byte,
-                    // so trailingZeroBitCount / 8 gives the correct
-                    // offset. On big-endian we'd need 7 - (leading / 8).
-                    #if _endian(big)
-                    return i + (7 - (y.leadingZeroBitCount / 8))
-                    #else
+                    // within the chunk.
                     return i + (y.trailingZeroBitCount / 8)
-                    #endif
                 }
                 i &+= 8
             }
@@ -120,11 +113,7 @@ public enum ByteSearch {
 
             // Iterate every `\r` candidate in this chunk.
             while y != 0 {
-                #if _endian(big)
-                let byteOffset = 7 - (y.leadingZeroBitCount / 8)
-                #else
                 let byteOffset = y.trailingZeroBitCount / 8
-                #endif
                 let pos = i + byteOffset
                 if pos + 4 <= end,
                    buffer[pos + 1] == 0x0A,
@@ -175,11 +164,7 @@ public enum ByteSearch {
             var y = (x &- 0x0101_0101_0101_0101) & ~x & 0x8080_8080_8080_8080
 
             while y != 0 {
-                #if _endian(big)
-                let byteOffset = 7 - (y.leadingZeroBitCount / 8)
-                #else
                 let byteOffset = y.trailingZeroBitCount / 8
-                #endif
                 let pos = i + byteOffset
                 if pos + 2 <= end, buffer[pos + 1] == 0x0A {
                     return pos
