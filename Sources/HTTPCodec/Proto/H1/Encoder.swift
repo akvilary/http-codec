@@ -122,6 +122,7 @@ public struct H1Encoder: Sendable {
             case .empty:        isStreaming = false
             case .buffered:     isStreaming = false
             case .stream:       isStreaming = true
+            case .pull:         isStreaming = false  // .pull is request-only
             }
         }
 
@@ -179,6 +180,10 @@ public struct H1Encoder: Sendable {
             return .buffered  // body exists but isn't copied into buffer
         case .stream:
             return .stream
+        case .pull:
+            // .pull is request-side only — a handler returning a .pull
+            // body as its response is a misuse. Treat as no body.
+            return .noBody
         }
     }
 
