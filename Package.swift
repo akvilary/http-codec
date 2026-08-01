@@ -1,38 +1,32 @@
 // swift-tools-version: 6.2
 //
-//  Hyper — Swift port of the Rust `hyper` crate.
+//  HTTPCodec — Swift port of the Rust `hyper` crate (codec layer).
 //
-//  HTTP/1.1 (and eventually HTTP/2) connection codec + server runtime.
-//  Direct 1:1 port of https://docs.rs/hyper — same Conn / Dispatcher /
-//  Encoder / Decoder split, same Body model, same rt (Read/Write/Timer)
-//  trait abstraction.
+//  HTTP/1.1 connection codec: request parsing, response encoding, the
+//  connection state machine, the body model, and a runtime-agnostic
+//  I/O abstraction. Direct port of https://docs.rs/hyper — same
+//  Conn / Encoder / Body / rt split, but the runtime binding (socket,
+//  event loop, request/response cycle) lives in a server crate, not
+//  here. In the Starlight workspace that server is `starlight`, which
+//  drives this codec from its `Worker` over a pulsar channel.
 //
 //  Depends on the Swift port of the `http` crate
 //  (https://github.com/akvilary/http) for message types, exactly as
 //  Rust's hyper depends on the `http` crate.
 //
-//  Layout (mirrors hyper's src/ tree):
+//  Layout:
 //
-//    Sources/Hyper/
-//    ├── Hyper.swift              lib.rs — prelude / re-exports
-//    ├── Error.swift              error.rs
-//    ├── Body/                    body/  — Body, Frame, Incoming
-//    ├── Common/                  common/ — small utilities
-//    ├── Ext/                     ext/    — request/response extensions
-//    ├── Headers.swift            headers.rs — header parsing helpers
-//    ├── Proto/                   proto/  — wire-level codec
-//    │   └── H1/                  proto/h1/ — HTTP/1.1
-//    │       ├── Conn.swift       Conn<Io, T> — connection driver
-//    │       ├── Decoder.swift    request parser (port of httparse)
-//    │       ├── Dispatcher.swift read/parse/dispatch/write loop
-//    │       ├── Encoder.swift    response writer
-//    │       ├── IO.swift         Buffered<Io> wrapper
-//    │       └── Server.swift     server-side Http1Transaction impl
-//    ├── RT/                      rt/ — Read / Write / Timer traits
-//    ├── Server/                  server/
-//    │   └── Conn/                server/conn/
-//    │       └── HTTP1.swift      server/conn/http1.rs — high-level builder
-//    └── Service/                 service/ — tower-Service adapters
+//    Sources/HTTPCodec/
+//    ├── HTTPCodec.swift              module prelude (@_exported import HTTP)
+//    ├── Error.swift                  HTTPCodecError
+//    ├── Body/Body.swift              HTTPCodecBody, Frame
+//    ├── Proto/H1/                    HTTP/1.1 wire codec
+//    │   ├── H1Conn.swift             H1Conn<IO> + H1ConnError + DecodedHead  (hyper proto::h1::Conn)
+//    │   ├── Http1ConnectionIO.swift  runtime I/O protocol                   (hyper rt::Read/Write)
+//    │   ├── Encoder.swift            H1Encoder, EncodedHead                  (hyper proto::h1::encode)
+//    │   ├── Server.swift             ServerTransaction (keep-alive policy)   (hyper proto::h1::Server)
+//    │   └── ByteSearch.swift         SWAR scanners                           (httparse helpers)
+//    └── RT/Timer.swift               AsyncTimer                              (hyper rt::Timer)
 //
 import PackageDescription
 
