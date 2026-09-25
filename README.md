@@ -31,7 +31,7 @@ macOS — it has no syscall dependencies.
 ## Installation
 
 ```swift
-.package(url: "https://github.com/akvilary/http-codec.git", from: "0.1.0")
+.package(url: "https://github.com/akvilary/http-codec.git", from: "0.2.0")
 ```
 
 ```swift
