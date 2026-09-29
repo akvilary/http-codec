@@ -11,7 +11,7 @@
 //  drives this codec from its `Worker` over a pulsar channel.
 //
 //  Depends on the Swift port of the `http` crate
-//  (https://github.com/akvilary/http) for message types, exactly as
+//  (https://github.com/akvilary/http-model) for message types, exactly as
 //  Rust's hyper depends on the `http` crate.
 //
 //  Layout:
@@ -42,13 +42,13 @@ let package = Package(
     dependencies: [
         // Swift port of the `http` crate — Request/Response/Method/
         // StatusCode/HeaderMap/Uri/Version.
-        .package(path: "../http"),
+        .package(path: "../http-model"),
     ],
     targets: [
         .target(
             name: "HTTPCodec",
             dependencies: [
-                .product(name: "HTTP", package: "http"),
+                .product(name: "HTTP", package: "http-model"),
             ],
             path: "Sources/HTTPCodec",
             swiftSettings: baseSwiftSettings

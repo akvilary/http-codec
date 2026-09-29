@@ -39,7 +39,7 @@ macOS — it has no syscall dependencies.
 ])
 ```
 
-Built on [`http`](https://github.com/akvilary/http) (the Swift port of
+Built on [`http-model`](https://github.com/akvilary/http-model) (the Swift port of
 the `http` crate) for `Request` / `Response` / `HeaderMap` / `Method` /
 `StatusCode` / `Uri` / `Version` / `Extensions`, exactly as Rust's hyper
 depends on the `http` crate.
