@@ -129,4 +129,140 @@ struct ByteSearchTests {
             #expect(result == 14)
         }
     }
+
+    // MARK: - SWAR boundary cases
+
+    @Test("findCRLFCRLF — terminator straddling the 8-byte SWAR boundary (starts at 6)")
+    func crlfcrlfStraddlesSWAR() {
+        // 6 filler bytes, then \r\n\r\n, then filler.
+        let buf: [UInt8] = [0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x0D, 0x0A, 0x0D, 0x0A, 0x58]
+        buf.withUnsafeBufferPointer { ptr in
+            #expect(ByteSearch.findCRLFCRLF(in: ptr, from: 0, to: buf.count) == 10)
+        }
+    }
+
+    @Test("findCRLFCRLF — terminator straddling the boundary (starts at 7)")
+    func crlfcrlfStraddlesSWAR7() {
+        let buf: [UInt8] = [0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x0D, 0x0A, 0x0D, 0x0A]
+        buf.withUnsafeBufferPointer { ptr in
+            #expect(ByteSearch.findCRLFCRLF(in: ptr, from: 0, to: buf.count) == 11)
+        }
+    }
+
+    @Test("findCRLFCRLF — terminator exactly at buffer end")
+    func crlfcrlfAtEnd() {
+        let buf: [UInt8] = [0x0D, 0x0A, 0x0D, 0x0A]
+        buf.withUnsafeBufferPointer { ptr in
+            #expect(ByteSearch.findCRLFCRLF(in: ptr, from: 0, to: buf.count) == 4)
+        }
+    }
+
+    @Test("findCRLFCRLF — incomplete trailing CRL needs more data")
+    func crlfcrlfIncompleteTail() {
+        // Ends with \r\n\r — the terminator cannot complete.
+        let buf: [UInt8] = [0x41, 0x0D, 0x0A, 0x0D]
+        buf.withUnsafeBufferPointer { ptr in
+            #expect(ByteSearch.findCRLFCRLF(in: ptr, from: 0, to: buf.count) == nil)
+        }
+    }
+
+    @Test("findCRLFCRLF — search resumes from a start offset")
+    func crlfcrlfFromOffset() {
+        let raw = "AAAA\r\n\r\nBBBB\r\n\r\n"
+        let buf = Array(raw.utf8)
+        buf.withUnsafeBufferPointer { ptr in
+            // First terminator ends at 8; resuming from 8 finds the second.
+            #expect(ByteSearch.findCRLFCRLF(in: ptr, from: 8, to: buf.count) == 16)
+            // Resuming from 6 (inside the first terminator) still works —
+            // the bytes at 6..7 are \r\n but not followed by \r\n.
+            #expect(ByteSearch.findCRLFCRLF(in: ptr, from: 6, to: buf.count) == 16)
+        }
+    }
+
+    @Test("findCRLF — CRLF straddling the SWAR boundary (CR at 7)")
+    func crlfStraddlesSWAR() {
+        let buf: [UInt8] = [0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x0D, 0x0A, 0x58]
+        buf.withUnsafeBufferPointer { ptr in
+            #expect(ByteSearch.findCRLF(in: ptr, from: 0, to: buf.count) == 7)
+        }
+    }
+
+    @Test("findByte — needle in last byte of buffer")
+    func findByteLastByte() {
+        let buf: [UInt8] = [0x41, 0x42, 0x43, 0x5A]
+        buf.withUnsafeBufferPointer { ptr in
+            #expect(ByteSearch.findByte(0x5A, in: ptr, from: 0, to: buf.count) == 3)
+        }
+    }
+
+    @Test("findByte — search window with start offset skips earlier matches")
+    func findByteOffset() {
+        let buf: [UInt8] = Array("A2345A2345A2345".utf8)
+        buf.withUnsafeBufferPointer { ptr in
+            #expect(ByteSearch.findByte(0x41, in: ptr, from: 6, to: buf.count) == 10)
+        }
+    }
+
+    // MARK: - 16-byte SWAR boundary cases
+
+    func probe(_ raw: String, needle: UInt8) -> Int? {
+        let buf = Array(raw.utf8)
+        return buf.withUnsafeBufferPointer { ptr in
+            ByteSearch.findByte(needle, in: ptr, from: 0, to: buf.count)
+        }
+    }
+
+    @Test("findByte — match straddling the 16-byte boundary (offsets 14/15)")
+    func findByte16Boundary() {
+        // 13 filler + needle at 13, 14, 15, 16.
+        #expect(probe(String(repeating: "x", count: 13) + "Z", needle: 0x5A) == 13)
+        #expect(probe(String(repeating: "x", count: 14) + "Z", needle: 0x5A) == 14)
+        #expect(probe(String(repeating: "x", count: 15) + "Z", needle: 0x5A) == 15)
+        #expect(probe(String(repeating: "x", count: 16) + "Z", needle: 0x5A) == 16)
+    }
+
+    @Test("findCRLFCRLF — terminator straddling the 16-byte boundary")
+    func crlfcrlf16Boundary() {
+        for offset in [12, 13, 14, 15, 16] {
+            let raw = String(repeating: "x", count: offset) + "\r\n\r\n" + "y"
+            let buf = Array(raw.utf8)
+            buf.withUnsafeBufferPointer { ptr in
+                #expect(ByteSearch.findCRLFCRLF(in: ptr, from: 0, to: buf.count) == offset + 4)
+            }
+        }
+    }
+
+    @Test("findCRLFCRLF — scattered \\r across two SWAR words, first terminator wins")
+    func crlfcrlfScatteredAcrossWords() {
+        // \r bytes at 4, 10 (word 0/1) — neither starts a terminator;
+        // the real one sits at 27 (second 16-byte iteration).
+        let raw = "aaaa\rbbbbb\rccccccccxxxxxxxx\r\n\r\n"
+        let buf = Array(raw.utf8)
+        buf.withUnsafeBufferPointer { ptr in
+            #expect(ByteSearch.findCRLFCRLF(in: ptr, from: 0, to: buf.count) == 31)
+        }
+    }
+
+    @Test("findCRLF — CRLF straddling the 16-byte boundary (CR at 15)")
+    func crlf16Boundary() {
+        let buf: [UInt8] = Array((String(repeating: "x", count: 15) + "\r\n").utf8)
+        buf.withUnsafeBufferPointer { ptr in
+            #expect(ByteSearch.findCRLF(in: ptr, from: 0, to: buf.count) == 15)
+        }
+    }
+
+    @Test("long scan — no false positives across many SWAR words")
+    func longScan() {
+        // 4 KB of mixed printable bytes with \r sprinkled but no
+        // terminator until the very end.
+        var raw = ""
+        for i in 0..<4000 {
+            raw.append(i % 37 == 0 ? "\r" : "a")
+        }
+        raw += "\r\n\r\n"
+        let buf = Array(raw.utf8)
+        buf.withUnsafeBufferPointer { ptr in
+            #expect(ByteSearch.findCRLFCRLF(in: ptr, from: 0, to: buf.count) == buf.count)
+        }
+    }
 }

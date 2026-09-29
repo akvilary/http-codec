@@ -18,15 +18,13 @@
 //
 //    Sources/HTTPCodec/
 //    ├── HTTPCodec.swift              module prelude (@_exported import HTTP)
-//    ├── Error.swift                  HTTPCodecError
-//    ├── Body/Body.swift              HTTPCodecBody, Frame
 //    ├── Proto/H1/                    HTTP/1.1 wire codec
 //    │   ├── H1Conn.swift             H1Conn<IO> + H1ConnError + DecodedHead  (hyper proto::h1::Conn)
 //    │   ├── Http1ConnectionIO.swift  runtime I/O protocol                   (hyper rt::Read/Write)
-//    │   ├── Encoder.swift            H1Encoder, EncodedHead                  (hyper proto::h1::encode)
+//    │   ├── Encoder.swift            H1Encoder, EncodedHead, H1EncodeError   (hyper proto::h1::encode)
 //    │   ├── Server.swift             ServerTransaction (keep-alive policy)   (hyper proto::h1::Server)
 //    │   └── ByteSearch.swift         SWAR scanners                           (httparse helpers)
-//    └── RT/Timer.swift               AsyncTimer                              (hyper rt::Timer)
+//    └── Tests/HTTPCodecTests/        smuggling regression suite (A17-A28 + v0.3 hardening)
 //
 import PackageDescription
 

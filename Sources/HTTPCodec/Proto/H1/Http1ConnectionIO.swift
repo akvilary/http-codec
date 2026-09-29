@@ -10,8 +10,8 @@
 //
 //  In the Starlight workspace, `PollEventLoopIO` (in StarlightServer)
 //  adapts this to a pulsar `PollEventLoop` channel — the analogue of
-//  hyper's tokio integration supplying `hyper::rt::Read/Write` over
-//  a tokio I/O handle.
+//  hyper's tokio integration supplying `hyper::rt::Read/Write` over a
+//  tokio I/O handle.
 //
 //===----------------------------------------------------------------------===//
 
@@ -35,14 +35,16 @@ public protocol Http1ConnectionIO: Sendable {
     /// number of bytes made available.
     ///
     /// - Returns: `> 0` bytes read, `0` for a clean EOF (peer closed),
-    ///   `< 0` for an error or timeout. The H1 codec maps any `< 0`
-    ///   (including the `-2` timeout sentinel some runtimes use) to an
-    ///   I/O error, mirroring hyper.
+    ///   `-1` for an I/O error or cancellation (including loop
+    ///   teardown — `ECANCELED`), `-2` for the phase deadline elapsing
+    ///   (timeout). The codec distinguishes all four outcomes:
+    ///   `0` mid-message → `incompleteMessage`, `-1` → `ioError`,
+    ///   `-2` → `timedOut`.
     ///
     /// - Parameter deadline: absolute time after which an unanswered
-    ///   read is failed with a negative value. `nil` disables the bound.
-    ///   The codec passes a per-phase deadline (header / body / drain)
-    ///   so a slow-drip client (Slowloris) is bounded across the whole
+    ///   read is failed with `-2`. `nil` disables the bound. The codec
+    ///   passes a per-phase deadline (header / body / drain) so a
+    ///   slow-drip client (Slowloris) is bounded across the whole
     ///   phase, not just per individual `read(2)`.
     func read(deadline: ContinuousClock.Instant?) async -> Int
 
@@ -61,11 +63,17 @@ public protocol Http1ConnectionIO: Sendable {
     /// (e.g. `100 Continue`) that must go out before the request body
     /// is read.
     ///
-    /// - Returns: bytes written, or `< 0` on error.
+    /// - Returns: bytes written (`0...bytes.count`), or `< 0` on
+    ///   error. A **partial** write (`0 < n < bytes.count`, e.g. the
+    ///   socket buffer filled mid-write on a non-blocking fd) is
+    ///   reported as-is: the codec treats any result `< bytes.count`
+    ///   as fatal for the connection — the interim response would be
+    ///   truncated on the wire and the peer left waiting — and tears
+    ///   the connection down.
     ///
     /// Synchronous (not `async`) by design: the codec is already on its
     /// loop thread and the payload is minute (~27 bytes), so the cost
-    /// of a readiness wait is not justified — same trade-off hyper
-    /// makes for interim `1xx` writes.
+    ///   of a readiness wait is not justified — same trade-off hyper
+    ///   makes for interim `1xx` writes.
     func writeRaw(_ bytes: [UInt8]) -> Int
 }
