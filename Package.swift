@@ -53,6 +53,12 @@ let package = Package(
             path: "Sources/HTTPCodec",
             swiftSettings: baseSwiftSettings
         ),
+        .executableTarget(
+            name: "http-codec-bench",
+            dependencies: ["HTTPCodec"],
+            path: "Sources/http-codec-bench",
+            swiftSettings: baseSwiftSettings
+        ),
         .testTarget(
             name: "HTTPCodecTests",
             dependencies: ["HTTPCodec"],

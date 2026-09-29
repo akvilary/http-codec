@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # http-codec depends on ../http via a local path (dev
+      # workspace layout) — check the two repos out side by side.
+      - uses: actions/checkout@v4
+        with:
+          path: server/http-codec
+      - uses: actions/checkout@v4
+        with:
+          repository: akvilary/http
+          path: server/http
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2"
+      - name: Test
+        working-directory: server/http-codec
+        run: swift test
+      - name: Benchmark smoke (release)
+        working-directory: server/http-codec
+        run: swift run -c release http-codec-bench

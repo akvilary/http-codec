@@ -42,6 +42,11 @@ final class MockIO: Http1ConnectionIO, @unchecked Sendable {
 
     /// When set, `read` returns this instead of draining chunks.
     var forceResult: Int?
+    /// Every deadline passed to `read`, in order.
+    private(set) var deadlines: [ContinuousClock.Instant] = []
+    /// Artificial delay before each read returns (deterministic
+    /// clock advance for deadline-semantics tests).
+    var interReadDelay: Duration?
     /// When set, `writeRaw` returns this instead of the byte count
     /// (partial-write simulation).
     var rawWriteResult: Int?
@@ -59,12 +64,20 @@ final class MockIO: Http1ConnectionIO, @unchecked Sendable {
     }
 
     func read(deadline: ContinuousClock.Instant?) async -> Int {
-        readSync(deadline: deadline)
+        // Prepare under the lock (sync helper — locking must not
+        // happen lexically inside an async context); the artificial
+        // delay (if any) happens OUTSIDE it.
+        let result = readSync(deadline: deadline)
+        if let d = interReadDelay, result > 0 {
+            try? await Task.sleep(for: d)
+        }
+        return result
     }
 
     private func readSync(deadline: ContinuousClock.Instant?) -> Int {
         lock.lock(); defer { lock.unlock() }
         lastDeadline = deadline
+        if let deadline { deadlines.append(deadline) }
         if let f = forceResult { return f }
         guard chunkIdx < chunks.count else { return 0 }  // EOF
         current = chunks[chunkIdx]
@@ -111,14 +124,16 @@ func makeConn(
     chunks: [[UInt8]],
     maxHeaderBytes: Int = 64 * 1024,
     maxBodyBytes: Int = 2 * 1024 * 1024,
-    maxHeaderCount: Int = 100
+    maxHeaderCount: Int = 100,
+    readTimeout: Duration = .seconds(30)
 ) -> H1Conn<MockIO> {
     H1Conn(
         io: MockIO(chunks: chunks),
         executor: testExecutor.asUnownedSerialExecutor(),
         maxHeaderBytes: maxHeaderBytes,
         maxBodyBytes: maxBodyBytes,
-        maxHeaderCount: maxHeaderCount
+        maxHeaderCount: maxHeaderCount,
+        readTimeout: readTimeout
     )
 }
 
@@ -858,6 +873,83 @@ struct H1TrailersTests {
         await #expect(throws: H1ConnError.noActiveRequest) {
             _ = try await conn.nextBodyChunk(forGeneration: 0)
         }
+    }
+}
+
+// MARK: - Deadline semantics
+
+@Suite("H1Conn deadline semantics")
+struct H1DeadlineTests {
+
+    @Test("header phase: one absolute deadline across all reads (Slowloris bound)")
+    func headerAbsolute() async throws {
+        // Head split across reads with real time passing between
+        // them — every header read must carry the SAME (absolute)
+        // deadline.
+        let conn = makeConn(chunks: [
+            req("GET / HTTP/1.1\r\nHo"),
+            req("st: x\r\nX-1: a\r\nX-"),
+            req("2: b\r\n\r\n"),
+        ], readTimeout: .seconds(30))
+        conn.io.interReadDelay = .milliseconds(15)
+        _ = try await conn.decodeHead()
+        let ds = conn.io.deadlines
+        #expect(ds.count == 3)
+        #expect(ds[0] == ds[1])
+        #expect(ds[1] == ds[2])
+    }
+
+    @Test("body phase: per-read stall deadline, refreshed on every read")
+    func bodyPerRead() async throws {
+        // A CL body split across reads: each read gets a FRESH
+        // now+timeout deadline (slow-but-steady uploads must not be
+        // killed by an absolute phase bound).
+        let conn = makeConn(chunks: [
+            req("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\nabc"),
+            req("def"),
+            req("ghi"),
+        ], readTimeout: .seconds(30))
+        conn.io.interReadDelay = .milliseconds(15)
+        let head = try await conn.decodeHead()
+        while let _ = try await conn.nextBodyChunk(forGeneration: head!.generation) {}
+        let ds = conn.io.deadlines
+        // 1 header read (the whole head arrived in one read and was
+        // parsed straight from the view — no copy) + 2 body reads.
+        #expect(ds.count == 3)
+        let headerDeadline = ds[0]
+        let bodyReads = ds[1..<3]
+        #expect(bodyReads.first! < bodyReads.last!)   // refreshed per read
+        // And the body deadlines are absolute-time fresh (now+30s
+        // at each read), i.e. later than the stale header deadline.
+        #expect(bodyReads.last! > headerDeadline)
+    }
+}
+
+// MARK: - Upgrade handover
+
+@Suite("H1Conn upgrade handover")
+struct H1UpgradeHandoverTests {
+
+    @Test("takeBufferedBytes returns pre-handshake bytes and resets")
+    func takeLeftover() async throws {
+        // A bodyless request with protocol bytes already received
+        // behind it (client sent them before the 101 was flushed).
+        let conn = makeConn(req(
+            "GET /up HTTP/1.1\r\nHost: x\r\nConnection: upgrade\r\nUpgrade: echo\r\n\r\nEARLY-FRAME"
+        ))
+        let head = try await conn.decodeHead()
+        #expect(head?.hasBody == false)
+        let leftover = await conn.takeBufferedBytes()
+        #expect(leftover == Array("EARLY-FRAME".utf8))
+        // Idempotent: a second handover yields nothing.
+        #expect(await conn.takeBufferedBytes() == [])
+    }
+
+    @Test("takeBufferedBytes with nothing buffered returns empty")
+    func takeEmpty() async throws {
+        let conn = makeConn(chunks: [req("GET /up HTTP/1.1\r\nHost: x\r\n\r\n"), []])
+        _ = try await conn.decodeHead()
+        #expect(await conn.takeBufferedBytes() == [])
     }
 }
 

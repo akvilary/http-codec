@@ -516,22 +516,49 @@ public actor H1Conn<IO: Http1ConnectionIO> {
         while true {
             skipLeadingCrlf()
 
-            var head: DecodedHead?
-            do {
-                head = try parseHeadFromBuffer()
-            } catch {
-                // Any parse failure poisons the framing — never let
-                // the connection continue on a half-consumed head.
-                state = .closed
-                throw error
+            // ── Buffer path ────────────────────────────────────────
+            // Bytes are already accumulated (a pipelined tail from a
+            // previous read, or a head that spans several reads).
+            // Parse directly over the buffer — rebased to the
+            // unconsumed region, resuming the terminator scan from
+            // `headerScanPos` (Slowloris defence: O(total), not
+            // O(n²) re-scans).
+            if readPos < buffer.count {
+                let start = readPos
+                var parsed: ParsedHead?
+                do {
+                    parsed = try Self.parseHead(
+                        from: buffer[start...],
+                        scanFrom: Swift.max(0, headerScanPos - start),
+                        maxHeaderBytes: maxHeaderBytes,
+                        maxHeaderCount: maxHeaderCount,
+                        into: &reusableHeaders
+                    )
+                } catch {
+                    // Any parse failure poisons the framing — never
+                    // let the connection continue on a half-consumed
+                    // head.
+                    state = .closed
+                    throw error
+                }
+                if let parsed {
+                    let head = try applyParsed(parsed)
+                    readPos = start + parsed.consumed
+                    headerScanPos = readPos
+                    maybeCompact()
+                    return head
+                }
+                // Incomplete: remember how far the terminator scan
+                // got (a new match can only begin in the last 3
+                // bytes) and bound the accumulated unparsed bytes.
+                headerScanPos = Swift.max(readPos, buffer.count - 3)
+                if buffer.count - readPos > maxHeaderBytes {
+                    state = .closed
+                    throw H1ConnError.requestTooLarge
+                }
             }
-            if let head { return head }
 
-            // Header block not yet complete — check size limit.
-            if buffer.count - readPos > maxHeaderBytes {
-                state = .closed
-                throw H1ConnError.requestTooLarge
-            }
+            // ── Read ───────────────────────────────────────────────
             let n = await readWithTimeout()
             if n == 0 {
                 if buffer.count > readPos {
@@ -551,9 +578,115 @@ public actor H1Conn<IO: Http1ConnectionIO> {
                 state = .closed
                 throw H1ConnError.ioError
             }
-            appendReadView(count: n)
             try Task.checkCancellation()
+
+            // ── View fast path ─────────────────────────────────────
+            // With nothing accumulated, parse straight out of the
+            // runtime's read buffer: the head is never copied at
+            // all — only bytes beyond it (body / pipelined tail)
+            // land in our buffer. This is the common case: a whole
+            // small request arriving in a single read. The view is
+            // valid until the next read, and no read happens while
+            // we hold it.
+            if readPos == buffer.count {
+                let view = io.readView(count: n)
+                // Leading CRLFs (RFC 9112 §2.2) are skipped within
+                // the view.
+                var off = 0
+                while off + 1 < view.count,
+                      view[off] == 0x0D, view[off + 1] == 0x0A {
+                    off &+= 2
+                }
+                let src = UnsafeBufferPointer<UInt8>(
+                    start: view.baseAddress! + off,
+                    count: view.count - off
+                )
+                var parsed: ParsedHead?
+                do {
+                    parsed = try Self.parseHeadBytes(
+                        from: src,
+                        scanFrom: 0,
+                        maxHeaderBytes: maxHeaderBytes,
+                        maxHeaderCount: maxHeaderCount,
+                        into: &reusableHeaders
+                    )
+                } catch {
+                    state = .closed
+                    throw error
+                }
+                if let parsed {
+                    let head = try applyParsed(parsed)
+                    // Recycle the (empty) buffer; copy only the tail
+                    // beyond the consumed head.
+                    buffer.removeAll(keepingCapacity: true)
+                    readPos = 0
+                    headerScanPos = 0
+                    if parsed.consumed < src.count {
+                        buffer.append(contentsOf: UnsafeBufferPointer<UInt8>(
+                            start: src.baseAddress! + parsed.consumed,
+                            count: src.count - parsed.consumed
+                        ))
+                    }
+                    return head
+                }
+                if src.count > maxHeaderBytes {
+                    state = .closed
+                    throw H1ConnError.requestTooLarge
+                }
+                // Incomplete head within the view — accumulate and
+                // continue on the buffer path.
+                buffer.append(contentsOf: src)
+                headerScanPos = Swift.max(readPos, buffer.count - 3)
+                continue
+            }
+
+            // Buffer holds a partial head — accumulate the new bytes
+            // next to it.
+            appendReadView(count: n)
         }
+    }
+
+    /// Apply a parsed head to the connection state machine (framing,
+    /// generation, request construction). Throws `requestTooLarge`
+    /// for a Content-Length above `maxBodyBytes` before any state is
+    /// applied.
+    private func applyParsed(_ parsed: ParsedHead) throws -> DecodedHead {
+        switch parsed.framing {
+        case .none:
+            state = .bodyDone
+        case .contentLength(let cl):
+            if cl > maxBodyBytes {
+                state = .closed
+                throw H1ConnError.requestTooLarge
+            }
+            state = .readingBody(remaining: cl)
+            bodyBytesConsumed = 0
+        case .chunked:
+            state = .readingChunkedBody
+            chunkState = .readSize
+            bodyBytesConsumed = 0
+            trailerLines = 0
+            trailerBytes = 0
+        }
+        pending100Continue = parsed.wants100Continue
+
+        reusableExtensions.removeAll()
+        let request = Request(
+            method: parsed.method,
+            uri: parsed.uri,
+            version: parsed.version,
+            headers: reusableHeaders,
+            body: .empty,  // the connection driver sets .pull(...) if hasBody
+            extensions: reusableExtensions
+        )
+        generation &+= 1
+        return DecodedHead(
+            request: request,
+            generation: generation,
+            keepAlive: parsed.keepAlive,
+            hasBody: parsed.hasBody,
+            expects100Continue: parsed.wants100Continue
+        )
     }
 
     /// Pull the next body chunk. Returns `nil` when the body is
@@ -569,13 +702,14 @@ public actor H1Conn<IO: Http1ConnectionIO> {
             throw BodyError.connectionAdvanced
         }
 
-        // Body phase starts here (lazily — excludes handler think-time
-        // before the first body read). A fresh deadline bounds the
-        // whole body read; set once per generation so a slow-drip body
-        // cannot evade it by resetting per chunk.
+        // Marks the body phase for the connection driver (see
+        // `hasStartedReadingBody`). NOTE: body reads are NOT bounded
+        // by an absolute phase deadline — a legitimate slow upload
+        // must not be killed mid-flight. Each read is stall-bounded
+        // individually (nginx `client_body_timeout` semantics); the
+        // total is bounded by `maxBodyBytes`.
         if !bodyReadStarted {
             bodyReadStarted = true
-            readDeadline = ContinuousClock.now + readTimeout
         }
 
         // First body read on an Expect: 100-continue request sends
@@ -638,11 +772,9 @@ public actor H1Conn<IO: Http1ConnectionIO> {
     public func drainBody() async throws {
         try Task.checkCancellation()
 
-        // Drain phase: its own fresh deadline (post-handler). Bounds
-        // the time spent discarding an unread body so a client that
-        // sends headers + slow-drip body, then never gets read by the
-        // handler, cannot hold the connection indefinitely.
-        readDeadline = ContinuousClock.now + readTimeout
+        // Drain reads are stall-bounded per read (like body reads —
+        // see readCLBodyChunk): a stalled peer is failed promptly;
+        // total drain time is bounded by `maxBodyBytes`.
 
         while !isBodyDone() {
             let chunk: [UInt8]?
@@ -664,6 +796,26 @@ public actor H1Conn<IO: Http1ConnectionIO> {
         state = .closed
     }
 
+    /// Hand over the bytes received beyond the current request —
+    /// the pre-handshake bytes of a protocol upgrade. After a 101
+    /// Switching Protocols response the connection leaves HTTP
+    /// framing: this drains and clears the accumulator so the tunnel
+    /// receives every byte the client sent after its upgrade request
+    /// (clients routinely send the first protocol frames immediately
+    /// after the handshake request, before the 101 is even flushed).
+    ///
+    /// Must be called after the request's body framing is complete —
+    /// any unconsumed request body would be discarded (a well-formed
+    /// upgrade request is bodyless). The connection must not be used
+    /// for further HTTP parsing afterwards.
+    public func takeBufferedBytes() -> [UInt8] {
+        let leftover = readPos < buffer.count ? Array(buffer[readPos...]) : []
+        buffer.removeAll(keepingCapacity: true)
+        readPos = 0
+        headerScanPos = 0
+        return leftover
+    }
+
     // MARK: - Head parsing
 
     /// RFC 9112 §2.2: a server SHOULD ignore at least one empty line
@@ -680,85 +832,115 @@ public actor H1Conn<IO: Http1ConnectionIO> {
         maybeCompact()
     }
 
-    /// Try to parse one request head from the buffered bytes.
-    /// Returns `nil` if the buffer doesn't yet contain the full
-    /// header block (`\r\n\r\n` terminator not found). Throws on
-    /// malformed input.
-    private func parseHeadFromBuffer() throws -> DecodedHead? {
+    /// Fully parsed request head — pure data; the actor applies it
+    /// (see `applyParsed`).
+    private struct ParsedHead {
+        let method: Method
+        let uri: Uri
+        let version: Version
+        let keepAlive: Bool
+        let hasBody: Bool
+        let wants100Continue: Bool
+        let framing: Framing
+        /// Bytes consumed from the source (request line + headers +
+        /// terminator).
+        let consumed: Int
+
+        enum Framing: Equatable {
+            case none
+            case contentLength(Int)
+            case chunked
+        }
+    }
+
+    /// Pure head parse over borrowed, 0-based bytes. No actor state
+    /// is touched: parsed headers accumulate into `headers`, framing
+    /// and metadata come back in the returned `ParsedHead`. This is
+    /// the single parser for both entry points — the connection's
+    /// accumulator and the runtime's read-view fast path (which
+    /// parses a request without ever copying its head).
+    ///
+    /// `scanFrom` resumes the `\r\n\r\n` scan (Slowloris defence —
+    /// everything before it is known not to start a terminator).
+    private nonisolated static func parseHeadBytes(
+        from src: UnsafeBufferPointer<UInt8>,
+        scanFrom: Int,
+        maxHeaderBytes: Int,
+        maxHeaderCount: Int,
+        into headers: inout HeaderMap
+    ) throws -> ParsedHead? {
         // 1. Locate the `\r\n\r\n` terminator (incrementally — see
         //    `headerScanPos`).
-        guard let headerEnd = findHeaderBlockEnd() else {
+        guard let headerEnd = ByteSearch.findCRLFCRLF(
+            in: src, from: scanFrom, to: src.count
+        ) else {
             return nil
         }
 
         // Enforce the header limit on COMPLETE heads too — the
         // decode-loop check only fires while the terminator is still
         // missing, so without this an oversized head that arrived in
-        // one piece would slip through. `headerEnd - readPos` is the
-        // exact head size (request line + headers + terminator),
-        // independent of any pipelined bytes after it.
-        if headerEnd &- readPos > maxHeaderBytes {
-            state = .closed
+        // one piece would slip through. `headerEnd` is the exact head
+        // size (request line + headers + terminator), independent of
+        // any bytes after it.
+        if headerEnd > maxHeaderBytes {
             throw H1ConnError.requestTooLarge
         }
 
-        var pos = readPos
+        var pos = 0
 
         // ── Request line: METHOD SP TARGET SP HTTP/1.x CRLF ────────
         // Exactly one SP between fields (RFC 9112 §3: request-line =
         // method SP request-target SP HTTP-version). Lenient multi-SP
         // parsing is a front/back-end desync vector — strict peers
         // (httparse, nginx) reject it, lenient ones don't.
-        guard let methodEnd = findByteInBuffer(0x20, from: pos, upto: headerEnd),
+        guard let methodEnd = ByteSearch.findByte(0x20, in: src, from: pos, to: headerEnd),
               methodEnd > pos,
               methodEnd &+ 1 < headerEnd,
-              buffer[methodEnd &+ 1] != 0x20
+              src[methodEnd &+ 1] != 0x20
         else { throw H1ConnError.malformedRequestLine }
         // Method must be a bare token (rejects bare CR/LF smuggled
         // into the request line and log-forging control bytes).
-        for i in pos..<methodEnd where !TokenList.isTokenByte(buffer[i]) {
+        for i in pos..<methodEnd where !TokenList.isTokenByte(src[i]) {
             throw H1ConnError.malformedRequestLine
         }
-        let method = buffer.withUnsafeBufferPointer { ptr in
-            Method(bytes: UnsafeBufferPointer(
-                start: ptr.baseAddress! + pos,
-                count: methodEnd - pos
-            ))
-        }
+        let method = Method(bytes: UnsafeBufferPointer(
+            start: src.baseAddress! + pos,
+            count: methodEnd - pos
+        ))
         pos = methodEnd &+ 1
 
-        guard let targetEnd = findByteInBuffer(0x20, from: pos, upto: headerEnd),
+        guard let targetEnd = ByteSearch.findByte(0x20, in: src, from: pos, to: headerEnd),
               targetEnd > pos,
               targetEnd &+ 1 < headerEnd,
-              buffer[targetEnd &+ 1] != 0x20
+              src[targetEnd &+ 1] != 0x20
         else { throw H1ConnError.malformedRequestLine }
         // Request target: visible ASCII or high bytes (raw UTF-8
         // targets are tolerated like nginx; control bytes and SP
         // are not — they cannot appear in any valid request-target
         // form and enable log forging / parser desync).
         for i in pos..<targetEnd {
-            let b = buffer[i]
+            let b = src[i]
             if b <= 0x20 || b == 0x7F {
                 throw H1ConnError.malformedRequestLine
             }
         }
-        let targetBytes = Array(buffer[pos..<targetEnd])
-        let uri = Uri(bytes: targetBytes)
+        let uri = Uri(bytes: Array(src[pos..<targetEnd]))
         pos = targetEnd &+ 1
 
         // Version: HTTP/1.x — starts immediately after the single SP.
         guard pos &+ 10 <= headerEnd,
-              buffer[pos] == 0x48, buffer[pos &+ 1] == 0x54,
-              buffer[pos &+ 2] == 0x54, buffer[pos &+ 3] == 0x50,
-              buffer[pos &+ 4] == 0x2F,  // "HTTP/"
-              buffer[pos &+ 5] == 0x31,  // '1'
-              buffer[pos &+ 6] == 0x2E   // '.'
+              src[pos] == 0x48, src[pos &+ 1] == 0x54,
+              src[pos &+ 2] == 0x54, src[pos &+ 3] == 0x50,
+              src[pos &+ 4] == 0x2F,  // "HTTP/"
+              src[pos &+ 5] == 0x31,  // '1'
+              src[pos &+ 6] == 0x2E   // '.'
         else {
             throw H1ConnError.unsupportedVersion(
-                String(decoding: buffer[pos..<min(pos &+ 10, headerEnd)], as: UTF8.self)
+                String(decoding: src[pos..<min(pos &+ 10, headerEnd)], as: UTF8.self)
             )
         }
-        let minorVersion = buffer[pos &+ 7]
+        let minorVersion = src[pos &+ 7]
         let version: Version
         switch minorVersion {
         case 0x30: version = .http10
@@ -770,14 +952,12 @@ public actor H1Conn<IO: Http1ConnectionIO> {
         }
         pos &+= 8
         guard pos &+ 1 < headerEnd,
-              buffer[pos] == 0x0D, buffer[pos &+ 1] == 0x0A
+              src[pos] == 0x0D, src[pos &+ 1] == 0x0A
         else { throw H1ConnError.malformedRequestLine }
         pos &+= 2
 
         // ── Headers ───────────────────────────────────────────────
-        reusableHeaders.entries.removeAll(keepingCapacity: true)
-        currentTrailers = nil
-        trailersComplete = false
+        headers.entries.removeAll(keepingCapacity: true)
         var headerIndex = 0
         var contentLength: Int? = nil
         var teHeaderSeen = false
@@ -790,7 +970,7 @@ public actor H1Conn<IO: Http1ConnectionIO> {
         var expect100Continue = false
 
         while pos < headerEnd &- 2 {
-            if buffer[pos] == 0x0D && buffer[pos &+ 1] == 0x0A { break }
+            if src[pos] == 0x0D && src[pos &+ 1] == 0x0A { break }
 
             headerIndex &+= 1
             if headerIndex > maxHeaderCount {
@@ -803,13 +983,13 @@ public actor H1Conn<IO: Http1ConnectionIO> {
             // names with embedded whitespace — both classic
             // front/back-end desync vectors.
             let nameStart = pos
-            while pos < headerEnd && buffer[pos] != 0x3A && buffer[pos] != 0x0D {
+            while pos < headerEnd && src[pos] != 0x3A && src[pos] != 0x0D {
                 pos &+= 1
             }
-            guard pos < headerEnd, buffer[pos] == 0x3A else {
+            guard pos < headerEnd, src[pos] == 0x3A else {
                 throw H1ConnError.malformedHeader(line: headerIndex)
             }
-            let nameBytes = buffer[nameStart..<pos]
+            let nameBytes = src[nameStart..<pos]
             if nameBytes.isEmpty {
                 throw H1ConnError.emptyHeaderName
             }
@@ -819,14 +999,12 @@ public actor H1Conn<IO: Http1ConnectionIO> {
             // Zero-alloc: the name lowercases into its (usually
             // inline) storage while borrowing the parse buffer — no
             // intermediate array, no map copy.
-            let name = buffer.withUnsafeBufferPointer { ptr in
-                HeaderName(lowercasingBuffer: UnsafeBufferPointer(
-                    start: ptr.baseAddress! + nameStart,
-                    count: pos - nameStart
-                ))
-            }
+            let name = HeaderName(lowercasingBuffer: UnsafeBufferPointer(
+                start: src.baseAddress! + nameStart,
+                count: pos - nameStart
+            ))
             pos &+= 1  // skip ':'
-            while pos < headerEnd && (buffer[pos] == 0x20 || buffer[pos] == 0x09) {
+            while pos < headerEnd && (src[pos] == 0x20 || src[pos] == 0x09) {
                 pos &+= 1
             }
             // Value: scan until CRLF. Reject bare CR / LF and other
@@ -834,9 +1012,9 @@ public actor H1Conn<IO: Http1ConnectionIO> {
             // the one CTL allowed inside field values.
             let valueStart = pos
             scanLoop: while pos < headerEnd &- 1 {
-                let b = buffer[pos]
+                let b = src[pos]
                 if b == 0x0D {
-                    if buffer[pos &+ 1] == 0x0A { break scanLoop }
+                    if src[pos &+ 1] == 0x0A { break scanLoop }
                     throw H1ConnError.bareCrLfInHeader(line: headerIndex)
                 }
                 if b == 0x0A {
@@ -850,22 +1028,19 @@ public actor H1Conn<IO: Http1ConnectionIO> {
             // Trim trailing whitespace.
             var valueEnd = pos
             while valueEnd > valueStart {
-                let prev = buffer[valueEnd &- 1]
+                let prev = src[valueEnd &- 1]
                 if prev == 0x20 || prev == 0x09 { valueEnd &-= 1 } else { break }
             }
             // Zero-alloc: the value copies straight from the parse
             // buffer into its (usually inline) storage.
-            let value = buffer.withUnsafeBufferPointer { ptr in
-                HeaderValue(borrowingBuffer: UnsafeBufferPointer(
-                    start: ptr.baseAddress! + valueStart,
-                    count: valueEnd - valueStart
-                ))
-            }
-            reusableHeaders.append(name, value)
-            // Framing checks read the value as a slice of the parse
-            // buffer — the common (non-framing) header path copies
-            // nothing at all.
-            let valueSlice = buffer[valueStart..<valueEnd]
+            let value = HeaderValue(borrowingBuffer: UnsafeBufferPointer(
+                start: src.baseAddress! + valueStart,
+                count: valueEnd - valueStart
+            ))
+            headers.append(name, value)
+            // Framing checks read the value as a slice of the source
+            // — the common (non-framing) header path copies nothing.
+            let valueSlice = src[valueStart..<valueEnd]
 
             // Track framing-relevant headers inline.
             if Self.isContentLength(nameBytes) {
@@ -906,7 +1081,7 @@ public actor H1Conn<IO: Http1ConnectionIO> {
                 let token = TokenList.expect100ContinueToken
                 if valueSlice.count == token.count {
                     var match = true
-                    for i in 0..<token.count where (buffer[valueStart &+ i] | 0x20) != token[i] {
+                    for i in 0..<token.count where (src[valueStart &+ i] | 0x20) != token[i] {
                         match = false
                         break
                     }
@@ -916,7 +1091,7 @@ public actor H1Conn<IO: Http1ConnectionIO> {
 
             // Consume CRLF.
             guard pos &+ 1 < headerEnd,
-                  buffer[pos] == 0x0D, buffer[pos &+ 1] == 0x0A
+                  src[pos] == 0x0D, src[pos &+ 1] == 0x0A
             else { throw H1ConnError.malformedHeader(line: headerIndex) }
             pos &+= 2
         }
@@ -970,7 +1145,7 @@ public actor H1Conn<IO: Http1ConnectionIO> {
         // as well; `upgrade`/`close`/`keep-alive` tokens are exempt
         // (the first is the handshake marker, the others are tokens,
         // not header names).
-        reusableHeaders.entries.removeAll { (n, _) in
+        headers.entries.removeAll { (n, _) in
             switch n {
             case .connection, .keepAlive, .te, .trailer, .proxyConnection:
                 return true
@@ -988,7 +1163,7 @@ public actor H1Conn<IO: Http1ConnectionIO> {
                     }
                     // Case-insensitive compare against the (already
                     // lowercased) stored names — no lowering copy.
-                    reusableHeaders.entries.removeAll { (n, _) in
+                    headers.entries.removeAll { (n, _) in
                         n.withUnsafeBytes { nb in
                             TokenList.bytesEqualCaseInsensitive(token, nb)
                         }
@@ -999,73 +1174,57 @@ public actor H1Conn<IO: Http1ConnectionIO> {
 
         // ── Determine body framing ────────────────────────────────
         let hasBody: Bool
-        let expectsBody: Bool
+        let framing: ParsedHead.Framing
         // HEAD requests never carry a body, even with Content-Length.
         if method == .HEAD {
             hasBody = false
-            expectsBody = false
-            state = .bodyDone
+            framing = .none
         } else if teHeaderSeen {
             hasBody = true
-            expectsBody = true
-            state = .readingChunkedBody
-            chunkState = .readSize
-            bodyBytesConsumed = 0
-            trailerLines = 0
-            trailerBytes = 0
-        } else if let cl = contentLength {
-            if cl == 0 {
-                hasBody = false
-                expectsBody = false
-                state = .bodyDone
-            } else {
-                // Early reject: CL larger than maxBodyBytes.
-                if cl > maxBodyBytes {
-                    state = .closed
-                    throw H1ConnError.requestTooLarge
-                }
-                hasBody = true
-                expectsBody = true
-                state = .readingBody(remaining: cl)
-                bodyBytesConsumed = 0
-            }
+            framing = .chunked
+        } else if let cl = contentLength, cl > 0 {
+            hasBody = true
+            framing = .contentLength(cl)
         } else {
             // No CL, no TE → no body for requests (RFC 9112 §6.3).
             hasBody = false
-            expectsBody = false
-            state = .bodyDone
+            framing = .none
         }
 
-        // Signal 100 Continue to the first nextBodyChunk call.
-        if expectsBody && expect100Continue {
-            pending100Continue = true
-        }
-
-        // ── Build Request ─────────────────────────────────────────
-        reusableExtensions.removeAll()
-        let request = Request(
+        return ParsedHead(
             method: method,
             uri: uri,
             version: version,
-            headers: reusableHeaders,
-            body: .empty,  // the connection driver sets .pull(...) if hasBody
-            extensions: reusableExtensions
-        )
-
-        // ── Consume header bytes from buffer ──────────────────────
-        readPos = headerEnd
-        headerScanPos = readPos
-        maybeCompact()
-
-        generation &+= 1
-
-        return DecodedHead(
-            request: request,
-            generation: generation,
             keepAlive: keepAlive,
             hasBody: hasBody,
-            expects100Continue: expect100Continue && expectsBody
+            wants100Continue: hasBody && expect100Continue,
+            framing: framing,
+            consumed: headerEnd
         )
+    }
+
+    /// Borrowed parse over a slice of the connection accumulator.
+    /// The slice's buffer keeps SLICE indices — rebased to 0 before
+    /// entering the single core parser.
+    private nonisolated static func parseHead(
+        from slice: ArraySlice<UInt8>,
+        scanFrom: Int,
+        maxHeaderBytes: Int,
+        maxHeaderCount: Int,
+        into headers: inout HeaderMap
+    ) throws -> ParsedHead? {
+        try slice.withUnsafeBufferPointer { raw in
+            let src = UnsafeBufferPointer<UInt8>(
+                start: raw.baseAddress, count: raw.count
+            )
+            return try parseHeadBytes(
+                from: src,
+                scanFrom: scanFrom,
+                maxHeaderBytes: maxHeaderBytes,
+                maxHeaderCount: maxHeaderCount,
+                into: &headers
+            )
+        }
     }
 
     // MARK: - Body: Content-Length bounded
@@ -1078,6 +1237,10 @@ public actor H1Conn<IO: Http1ConnectionIO> {
         }
         let available = buffer.count &- readPos
         if available == 0 {
+            // Per-read stall bound: every individual read must make
+            // progress within `readTimeout` (slow-but-steady uploads
+            // are legit; only a stalled peer is failed).
+            readDeadline = ContinuousClock.now + readTimeout
             let n = await readWithTimeout()
             if n == 0 {
                 // Unexpected EOF — client closed before CL bytes arrived.
@@ -1426,6 +1589,8 @@ public actor H1Conn<IO: Http1ConnectionIO> {
     /// Used by the chunked body paths when the buffer is empty.
     private func ensureBytesAvailable() async throws {
         try Task.checkCancellation()
+        // Per-read stall bound (see readCLBodyChunk).
+        readDeadline = ContinuousClock.now + readTimeout
         let n = await readWithTimeout()
         if n == 0 {
             state = .closed
@@ -1493,37 +1658,10 @@ public actor H1Conn<IO: Http1ConnectionIO> {
 
     // MARK: - Byte search helpers
 
-    /// Find `\r\n\r\n` (end of header block). Returns the index
-    /// after the final `\n`, or `nil` if not present in the
-    /// unconsumed portion of the buffer. The search resumes from
-    /// `headerScanPos` — everything before it is known not to
-    /// contain a terminator (Slowloris defence, see `headerScanPos`).
-    private func findHeaderBlockEnd() -> Int? {
-        let start = Swift.max(readPos, Swift.min(headerScanPos, buffer.count))
-        let end = buffer.count
-        guard end &- start >= 4 else { return nil }
-        let found = buffer.withUnsafeBufferPointer { ptr in
-            ByteSearch.findCRLFCRLF(in: ptr, from: start, to: end)
-        }
-        if found == nil {
-            // A terminator can still begin in the last 3 bytes —
-            // resume there next time.
-            headerScanPos = Swift.max(readPos, buffer.count - 3)
-        }
-        return found
-    }
-
-    /// Linear / SWAR byte search within the unconsumed buffer.
-    private func findByteInBuffer(_ needle: UInt8, from start: Int, upto end: Int) -> Int? {
-        buffer.withUnsafeBufferPointer { ptr in
-            ByteSearch.findByte(needle, in: ptr, from: start, to: end)
-        }
-    }
-
     // MARK: - Static header-name recognisers (case-insensitive)
 
     @inline(__always)
-    private static func isContentLength(_ name: ArraySlice<UInt8>) -> Bool {
+    private static func isContentLength(_ name: Slice<UnsafeBufferPointer<UInt8>>) -> Bool {
         // "content-length" (14 bytes)
         let expected: [UInt8] = [
             0x63, 0x6F, 0x6E, 0x74, 0x65, 0x6E, 0x74, 0x2D,
@@ -1533,7 +1671,7 @@ public actor H1Conn<IO: Http1ConnectionIO> {
     }
 
     @inline(__always)
-    private static func isTransferEncoding(_ name: ArraySlice<UInt8>) -> Bool {
+    private static func isTransferEncoding(_ name: Slice<UnsafeBufferPointer<UInt8>>) -> Bool {
         // "transfer-encoding" (17 bytes)
         let expected: [UInt8] = [
             0x74, 0x72, 0x61, 0x6E, 0x73, 0x66, 0x65, 0x72, 0x2D,
@@ -1543,7 +1681,7 @@ public actor H1Conn<IO: Http1ConnectionIO> {
     }
 
     @inline(__always)
-    private static func isHost(_ name: ArraySlice<UInt8>) -> Bool {
+    private static func isHost(_ name: Slice<UnsafeBufferPointer<UInt8>>) -> Bool {
         // "host" (4 bytes) — short-circuit on length.
         guard name.count == 4 else { return false }
         let s = name.startIndex
@@ -1554,7 +1692,7 @@ public actor H1Conn<IO: Http1ConnectionIO> {
     }
 
     @inline(__always)
-    private static func isConnection(_ name: ArraySlice<UInt8>) -> Bool {
+    private static func isConnection(_ name: Slice<UnsafeBufferPointer<UInt8>>) -> Bool {
         // "connection" (10 bytes)
         let expected: [UInt8] = [
             0x63, 0x6F, 0x6E, 0x6E, 0x65, 0x63, 0x74, 0x69, 0x6F, 0x6E
@@ -1563,14 +1701,14 @@ public actor H1Conn<IO: Http1ConnectionIO> {
     }
 
     @inline(__always)
-    private static func isExpect(_ name: ArraySlice<UInt8>) -> Bool {
+    private static func isExpect(_ name: Slice<UnsafeBufferPointer<UInt8>>) -> Bool {
         // "expect" (6 bytes)
         let expected: [UInt8] = [0x65, 0x78, 0x70, 0x65, 0x63, 0x74]
         return matchName(name, expected: expected)
     }
 
     @inline(__always)
-    private static func matchName(_ name: ArraySlice<UInt8>, expected: [UInt8]) -> Bool {
+    private static func matchName(_ name: Slice<UnsafeBufferPointer<UInt8>>, expected: [UInt8]) -> Bool {
         guard name.count == expected.count else { return false }
         var i = 0
         for b in name {
