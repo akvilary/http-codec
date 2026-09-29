@@ -748,6 +748,20 @@ public actor H1Conn<IO: Http1ConnectionIO> {
         }
     }
 
+    /// True when the codec is in a terminal state — it errored out
+    /// mid-request (body overrun, malformed framing, bomb defence)
+    /// and can never decode another request on this connection.
+    ///
+    /// `isBodyDone()` also returns true here, but for a different
+    /// reason: the connection driver uses THIS predicate to decide
+    /// that keep-alive is impossible and the connection must be torn
+    /// down (with a lingering drain so the already-written response
+    /// still reaches the peer).
+    public func isClosed() -> Bool {
+        if case .closed = state { return true }
+        return false
+    }
+
     /// True once `nextBodyChunk` has been called for the current
     /// request (i.e. the handler actually started consuming the
     /// body). The connection driver uses this together with
