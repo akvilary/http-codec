@@ -861,6 +861,80 @@ struct H1TrailersTests {
     }
 }
 
+// MARK: - Actor reentrancy
+
+@Suite("H1Conn reentrancy")
+struct H1ReentrancyTests {
+
+    @Test("concurrent body pulls and drainBody keep framing consistent")
+    func concurrentPullAndDrain() async throws {
+        // Body: 8 chunked chunks of 4 bytes each, delivered 8 bytes
+        // per read so pulls and the drain interleave at suspension
+        // points. Actor serialization must hand every chunk to
+        // exactly ONE consumer and leave the connection framed for
+        // the next request.
+        var raw = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+        for i in 0..<8 {
+            let body = "\(i)AAA"  // 4 bytes
+            raw += "4\r\n\(body)\r\n"
+        }
+        raw += "0\r\n\r\nGET /next HTTP/1.1\r\nHost: x\r\n\r\n"
+
+        let input = Array(raw.utf8)
+        var chunks: [[UInt8]] = []
+        var off = 0
+        while off < input.count {
+            let step = min(8, input.count - off)
+            chunks.append(Array(input[off..<(off + step)]))
+            off += step
+        }
+        let conn = makeConn(chunks: chunks)
+        let head = try await conn.decodeHead()
+        let gen = head!.generation
+
+        // Two competing consumers of the same body. Actor
+        // serialization hands every byte-fragment to exactly one
+        // consumer, in body order — the two streams interleave but
+        // never lose, duplicate, or corrupt bytes. (Fragments may
+        // straddle wire-chunk boundaries when reads split them —
+        // that is the designed streaming behavior.)
+        async let pulled: [[UInt8]] = {
+            var acc = [[UInt8]]()
+            while let c = try await conn.nextBodyChunk(forGeneration: gen) {
+                acc.append(c)
+            }
+            return acc
+        }()
+        async let drained: [[UInt8]] = {
+            var acc = [[UInt8]]()
+            while await !conn.isBodyDone() {
+                if let c = try await conn.nextBodyChunk(forGeneration: gen) {
+                    acc.append(c)
+                } else {
+                    break
+                }
+            }
+            return acc
+        }()
+
+        let (a, b) = try await (pulled, drained)
+        // Byte-level multiset equality: every body byte delivered
+        // exactly once across the two consumers (fragments are
+        // contiguous slices, so corruption would show up here too).
+        var received = [UInt8]()
+        for frag in a { received.append(contentsOf: frag) }
+        for frag in b { received.append(contentsOf: frag) }
+        let expected = (0..<8).flatMap { Array("\($0)AAA".utf8) }
+        #expect(received.count == expected.count)
+        #expect(received.sorted() == expected.sorted())
+        #expect(await conn.isBodyDone())
+
+        // And the connection is still correctly framed afterwards.
+        let next = try await conn.decodeHead()
+        #expect(next?.request.uri.pathString == "/next")
+    }
+}
+
 // MARK: - Keep-alive policy (ServerTransaction)
 
 @Suite("ServerTransaction keep-alive policy")

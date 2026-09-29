@@ -153,6 +153,15 @@ public struct DecodedHead: Sendable {
 /// no allocation, no `String` round-trip.
 enum TokenList {
 
+    // Immortal token constants — array literals in Swift allocate a
+    // fresh buffer on EVERY evaluation, and these appear on the
+    // per-request hot path.
+    static let closeToken: [UInt8] = [0x63, 0x6C, 0x6F, 0x73, 0x65]  // "close"
+    static let keepAliveToken: [UInt8] = [0x6B, 0x65, 0x65, 0x70, 0x2D, 0x61, 0x6C, 0x69, 0x76, 0x65]  // "keep-alive"
+    static let upgradeToken: [UInt8] = [0x75, 0x70, 0x67, 0x72, 0x61, 0x64, 0x65]  // "upgrade"
+    static let expect100ContinueToken: [UInt8] = [0x31, 0x30, 0x30, 0x2D, 0x63, 0x6F, 0x6E, 0x74, 0x69, 0x6E, 0x75, 0x65]  // "100-continue"
+    static let chunkedToken: [UInt8] = [0x63, 0x68, 0x75, 0x6E, 0x6B, 0x65, 0x64]  // "chunked"
+
     /// RFC 9110 tchar — valid byte in a token (methods, header names,
     /// token list elements).
     @inline(__always)
@@ -250,8 +259,7 @@ enum TokenList {
         chunkedCount: inout Int,
         lastTokenChunked: inout Bool
     ) {
-        // "chunked"
-        let chunked: [UInt8] = [0x63, 0x68, 0x75, 0x6E, 0x6B, 0x65, 0x64]
+        let chunked = TokenList.chunkedToken
         forEachToken(valueBytes) { token in
             var isChunked = token.count == chunked.count
             if isChunked {
@@ -885,20 +893,20 @@ public actor H1Conn<IO: Http1ConnectionIO> {
                 // Token matching is case-insensitive — no lowering
                 // copy needed. Rare header — materialise once for
                 // the connection-listed strip below.
-                if TokenList.contains(valueSlice, token: [0x63, 0x6C, 0x6F, 0x73, 0x65]) {  // "close"
+                if TokenList.contains(valueSlice, token: TokenList.closeToken) {
                     connectionClose = true
                 }
-                if TokenList.contains(valueSlice, token: [0x6B, 0x65, 0x65, 0x70, 0x2D, 0x61, 0x6C, 0x69, 0x76, 0x65]) {  // "keep-alive"
+                if TokenList.contains(valueSlice, token: TokenList.keepAliveToken) {
                     connectionKeepAlive = true
                 }
                 connectionTokens.append(Array(valueSlice))
             } else if Self.isExpect(nameBytes) {
                 // "100-continue" — inline case-insensitive compare
                 // over the slice, no copies.
-                if valueSlice.count == 12 {
+                let token = TokenList.expect100ContinueToken
+                if valueSlice.count == token.count {
                     var match = true
-                    let token: [UInt8] = [0x31, 0x30, 0x30, 0x2D, 0x63, 0x6F, 0x6E, 0x74, 0x69, 0x6E, 0x75, 0x65]
-                    for i in 0..<12 where (buffer[valueStart &+ i] | 0x20) != token[i] {
+                    for i in 0..<token.count where (buffer[valueStart &+ i] | 0x20) != token[i] {
                         match = false
                         break
                     }
@@ -971,15 +979,11 @@ public actor H1Conn<IO: Http1ConnectionIO> {
             }
         }
         if !connectionTokens.isEmpty {
-            // Exempt tokens that are markers, not header names.
-            let close: [UInt8] = Array("close".utf8)
-            let keepAlive: [UInt8] = Array("keep-alive".utf8)
-            let upgrade: [UInt8] = Array("upgrade".utf8)
             for value in connectionTokens {
                 TokenList.forEachToken(value) { token in
-                    if TokenList.sliceEqualCaseInsensitive(token, close)
-                        || TokenList.sliceEqualCaseInsensitive(token, keepAlive)
-                        || TokenList.sliceEqualCaseInsensitive(token, upgrade) {
+                    if TokenList.sliceEqualCaseInsensitive(token, TokenList.closeToken)
+                        || TokenList.sliceEqualCaseInsensitive(token, TokenList.keepAliveToken)
+                        || TokenList.sliceEqualCaseInsensitive(token, TokenList.upgradeToken) {
                         return
                     }
                     // Case-insensitive compare against the (already

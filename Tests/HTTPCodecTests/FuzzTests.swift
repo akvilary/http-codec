@@ -110,7 +110,12 @@ struct H1FuzzTests {
     /// path terminates without external events. Returns the escaped
     /// error, if any — the tests assert it is always a TYPED codec
     /// error (never a raw crash / unexpected type).
-    static func drive(_ input: [UInt8], chunkSize: Int?) async -> Error? {
+    static func drive(
+        _ input: [UInt8],
+        chunkSize: Int?,
+        partial100: Bool = false,
+        forcedReadResult: Int? = nil
+    ) async -> Error? {
         let chunks: [[UInt8]]
         if let size = chunkSize, input.count > 1 {
             let step = max(size, 1)
@@ -120,8 +125,15 @@ struct H1FuzzTests {
         } else {
             chunks = [input]
         }
+        let mock = MockIO(chunks: chunks)
+        if partial100 {
+            // Simulate a truncated interim-write: the codec must
+            // treat it as fatal and surface a typed error.
+            mock.rawWriteResult = 1
+        }
+        mock.forceResult = forcedReadResult
         let conn = H1Conn<MockIO>(
-            io: MockIO(chunks: chunks),
+            io: mock,
             executor: testExecutor.asUnownedSerialExecutor(),
             maxHeaderBytes: 4096,
             maxBodyBytes: 4096,
@@ -156,9 +168,9 @@ struct H1FuzzTests {
         }
     }
 
-    @Test("mutated corpus — 600 seeded iterations, no trap, typed errors only")
+    @Test("mutated corpus — 4000 seeded iterations, no trap, typed errors only")
     func mutatedCorpus() async throws {
-        for seed in UInt64(1)...600 {
+        for seed in UInt64(1)...4000 {
             var rng = FuzzPRNG(seed: seed)
             let base = fuzzCorpus[rng.range(fuzzCorpus.count)]
             let mutated = mutate(base, &rng)
@@ -168,15 +180,43 @@ struct H1FuzzTests {
         }
     }
 
-    @Test("pure noise — 400 seeded iterations")
+    @Test("pure noise — 2000 seeded iterations")
     func pureNoise() async throws {
-        for seed in UInt64(1)...400 {
+        for seed in UInt64(1)...2000 {
             var rng = FuzzPRNG(seed: seed &+ 0xDEAD_BEEF)
             let len = 1 + rng.range(600)
             var bytes = [UInt8]()
             bytes.reserveCapacity(len)
             for _ in 0..<len { bytes.append(rng.byte()) }
             Self.assertTyped(await Self.drive(bytes, chunkSize: nil))
+        }
+    }
+
+    @Test("partial 100-continue writes — 500 iterations, always fatal + typed")
+    func partialWrites() async throws {
+        for seed in UInt64(1)...500 {
+            var rng = FuzzPRNG(seed: seed &+ 0xABC0_1005)
+            let base = fuzzCorpus[2]  // the Expect: 100-continue entry
+            let mutated = mutate(base, &rng)
+            let error = await Self.drive(mutated, chunkSize: nil, partial100: true)
+            Self.assertTyped(error)
+        }
+    }
+
+    @Test("forced read failures (timeout -2 / error -1) — typed mapping")
+    func forcedReadFailures() async throws {
+        for forced in [-2, -1] {
+            for seed in UInt64(1)...100 {
+                var rng = FuzzPRNG(seed: UInt64(bitPattern: Int64(forced)) &+ seed)
+                let base = fuzzCorpus[rng.range(fuzzCorpus.count)]
+                let mutated = mutate(base, &rng)
+                let error = await Self.drive(
+                    mutated, chunkSize: nil, forcedReadResult: forced
+                )
+                if let error, let e = error as? H1ConnError {
+                    #expect(e == .timedOut || e == .ioError)
+                }
+            }
         }
     }
 

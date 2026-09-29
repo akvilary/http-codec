@@ -73,6 +73,9 @@ public enum H1EncodeError: Error, Sendable, Equatable {
     /// The handler set more than one `Connection` header — a sender
     /// MUST NOT (RFC 9110 §5.2); contradictory tokens are a bug.
     case duplicateConnection
+    /// The handler set more than one `Date` header (RFC 9110 §6.6.1
+    /// — an origin server MUST NOT send more than one Date).
+    case duplicateDate
 }
 
 /// Result of `H1Encoder.encodeHead(...)`. Tells the caller what to
@@ -168,7 +171,7 @@ public struct H1Encoder: Sendable {
         var userTransferEncoding: [UInt8]? = nil
         var userTransferEncodingCount = 0
         var userConnectionCount = 0
-        var sawDate = false
+        var dateCount = 0
         for (name, value) in response.headers.entries {
             if name == .contentLength {
                 userContentLengthCount &+= 1
@@ -179,12 +182,16 @@ public struct H1Encoder: Sendable {
             } else if name == .connection {
                 userConnectionCount &+= 1
             } else if name == .date {
-                sawDate = true
+                dateCount &+= 1
             }
         }
         if userContentLengthCount > 1 {
             throw H1EncodeError.invalidContentLength("duplicate Content-Length")
         }
+        if dateCount > 1 {
+            throw H1EncodeError.duplicateDate
+        }
+        let sawDate = dateCount == 1
 
         // ── Status line ───────────────────────────────────────────
         writeStatusLine(response.status, into: &buffer)
@@ -424,18 +431,20 @@ public struct H1Encoder: Sendable {
     /// Sent after the last data chunk. Optionally includes trailers
     /// (Phase 2 polish — currently no trailers support).
     public func encodeEndOfChunks(into buffer: inout [UInt8]) {
-        buffer.append(contentsOf: [0x30])  // '0'
+        buffer.append(0x30)  // '0'
         buffer.append(contentsOf: Self.crlf)
         buffer.append(contentsOf: Self.crlf)
     }
 
     // MARK: - Status line
 
+    private static let statusLinePrefix: [UInt8] = [
+        0x48, 0x54, 0x54, 0x50, 0x2F, 0x31, 0x2E, 0x31, 0x20
+    ]
+
     @inline(__always)
     private func writeStatusLine(_ status: StatusCode, into buffer: inout [UInt8]) {
-        buffer.append(contentsOf: [
-            0x48, 0x54, 0x54, 0x50, 0x2F, 0x31, 0x2E, 0x31, 0x20
-        ])
+        buffer.append(contentsOf: Self.statusLinePrefix)
         let code = status.code
         buffer.append(0x30 + UInt8(code / 100))
         buffer.append(0x30 + UInt8((code / 10) % 10))
@@ -565,7 +574,10 @@ public struct H1Encoder: Sendable {
 
 extension H1Encoder {
 
-    @inlinable internal static var crlf: [UInt8] { [0x0D, 0x0A] }
+    // Stored (not computed): an array literal in a computed property
+    // allocates a fresh buffer on EVERY access — this one is used
+    // ~once per header written.
+    internal static let crlf: [UInt8] = [0x0D, 0x0A]
     internal static let dateNameColonSP: [UInt8] = Array("Date: ".utf8)
 
     /// Process-wide RFC 9110 §6.6.1 IMF-fixdate cache — one locked
