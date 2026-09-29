@@ -42,7 +42,7 @@
 //===----------------------------------------------------------------------===//
 
 import Foundation
-import HTTP
+import HTTPModel
 
 /// Errors thrown by `H1Conn` during head parsing and body framing.
 ///

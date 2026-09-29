@@ -13,7 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import Foundation
-import HTTP
+import HTTPModel
 
 /// Server-side HTTP/1.1 transaction policy. Direct port of
 /// `hyper::proto::h1::Server` impl of `Http1Transaction`.

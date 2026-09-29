@@ -54,7 +54,7 @@ a request head lazily; the body is pulled on demand:
 
 ```swift
 import HTTPCodec
-import HTTP
+import HTTPModel
 
 // IO is supplied by the runtime (see Http1ConnectionIO below).
 let conn = H1Conn(io: io, executor: executor)
@@ -145,7 +145,7 @@ that's `PollEventLoopIO` over a pulsar `PollEventLoop`.
 
 ```
 Sources/HTTPCodec/
-├── HTTPCodec.swift              module prelude (@_exported import HTTP)
+├── HTTPCodec.swift              module prelude (@_exported import HTTPModel)
 └── Proto/H1/                    HTTP/1.1 wire codec
     ├── H1Conn.swift             H1Conn<IO> + H1ConnError + DecodedHead  (hyper proto::h1::Conn)
     ├── Http1ConnectionIO.swift  runtime I/O protocol                   (hyper rt::Read/Write)

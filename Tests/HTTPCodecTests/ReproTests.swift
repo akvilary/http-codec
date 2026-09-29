@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-import HTTP
+import HTTPModel
 @testable import HTTPCodec
 
 /// Regression: pipelined chunked bodies delivered in large chunks —

@@ -48,7 +48,7 @@ let package = Package(
         .target(
             name: "HTTPCodec",
             dependencies: [
-                .product(name: "HTTP", package: "http-model"),
+                .product(name: "HTTPModel", package: "http-model"),
             ],
             path: "Sources/HTTPCodec",
             swiftSettings: baseSwiftSettings

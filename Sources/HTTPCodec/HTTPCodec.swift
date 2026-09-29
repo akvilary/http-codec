@@ -13,8 +13,8 @@
 //===----------------------------------------------------------------------===//
 
 import Foundation
-@_exported import HTTP
+@_exported import HTTPModel
 
-// `HTTP` provides: Request, Response, HeaderMap, HeaderName,
+// `HTTPModel` provides: Request, Response, HeaderMap, HeaderName,
 // HeaderValue, Method, StatusCode, Uri, Version, Body, Extensions.
 // Re-exported above via `@_exported`.

@@ -20,7 +20,7 @@
 
 import Testing
 import Foundation
-import HTTP
+import HTTPModel
 @testable import HTTPCodec
 
 @Suite("Desync corpus")

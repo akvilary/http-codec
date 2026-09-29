@@ -26,7 +26,7 @@
 
 import Testing
 import Foundation
-import HTTP
+import HTTPModel
 @testable import HTTPCodec
 
 /// Deterministic xorshift64* PRNG — no Foundation RNG dependency,

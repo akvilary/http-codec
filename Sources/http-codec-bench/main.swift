@@ -14,7 +14,7 @@
 //===----------------------------------------------------------------------===//
 
 import Foundation
-import HTTP
+import HTTPModel
 import HTTPCodec
 
 // MARK: - Feeding I/O

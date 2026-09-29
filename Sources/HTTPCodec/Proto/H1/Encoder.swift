@@ -48,7 +48,7 @@
 //===----------------------------------------------------------------------===//
 
 import Foundation
-import HTTP
+import HTTPModel
 
 /// Errors thrown while encoding a response head. All of them are
 /// handler-authoring bugs (or a compromised handler) — the connection
